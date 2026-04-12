@@ -34,8 +34,16 @@ import type {
   AgentHooks,
 } from '../agents/runtime/agent-events.js';
 import type { Config } from '../config/config.js';
+import {
+  type AuthType,
+  type ContentGenerator,
+  type ContentGeneratorConfig,
+  createContentGenerator,
+} from '../core/contentGenerator.js';
+import { buildAgentContentGeneratorConfig } from '../models/content-generator-config.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
 import { normalizeContent } from '../utils/textUtils.js';
+import { parseSubagentModelSelection } from './model-selection.js';
 
 const debugLogger = createDebugLogger('SUBAGENT_MANAGER');
 import { BuiltinAgentRegistry } from './builtin-agents.js';
@@ -155,6 +163,8 @@ export class SubagentManager {
     name: string,
     level?: SubagentLevel,
   ): Promise<SubagentConfig | null> {
+    const lowerName = name.toLowerCase();
+
     if (level) {
       // Search only the specified level
       if (level === 'builtin') {
@@ -163,7 +173,11 @@ export class SubagentManager {
 
       if (level === 'session') {
         const sessionSubagents = this.subagentsCache?.get('session') || [];
-        return sessionSubagents.find((agent) => agent.name === name) || null;
+        return (
+          sessionSubagents.find(
+            (agent) => agent.name.toLowerCase() === lowerName,
+          ) || null
+        );
       }
 
       return this.findSubagentByNameAtLevel(name, level);
@@ -171,7 +185,9 @@ export class SubagentManager {
 
     // Try session level first (highest priority for runtime)
     const sessionSubagents = this.subagentsCache?.get('session') || [];
-    const sessionConfig = sessionSubagents.find((agent) => agent.name === name);
+    const sessionConfig = sessionSubagents.find(
+      (agent) => agent.name.toLowerCase() === lowerName,
+    );
     if (sessionConfig) {
       return sessionConfig;
     }
@@ -480,6 +496,12 @@ export class SubagentManager {
       subagentsCache.set(level, levelSubagents);
     }
 
+    // Preserve session subagents from old cache
+    const sessionSubagents = this.subagentsCache?.get('session');
+    if (sessionSubagents) {
+      subagentsCache.set('session', sessionSubagents);
+    }
+
     this.subagentsCache = subagentsCache;
     this.notifyChangeListeners();
   }
@@ -560,10 +582,8 @@ export class SubagentManager {
       frontmatter['tools'] = config.tools;
     }
 
-    // No outputs section
-
-    if (config.modelConfig) {
-      frontmatter['modelConfig'] = config.modelConfig;
+    if (config.model && config.model !== 'inherit') {
+      frontmatter['model'] = config.model;
     }
 
     if (config.runConfig) {
@@ -602,9 +622,17 @@ export class SubagentManager {
     try {
       const runtimeConfig = this.convertToRuntimeConfig(config);
 
+      // When the model selector specifies a different provider, build a
+      // per-agent Config with a dedicated ContentGenerator so the subagent
+      // talks to the right API without affecting the parent process.
+      const agentContext = await this.maybeOverrideContentGenerator(
+        config,
+        runtimeContext,
+      );
+
       return await AgentHeadless.create(
         config.name,
-        runtimeContext,
+        agentContext,
         runtimeConfig.promptConfig,
         runtimeConfig.modelConfig,
         runtimeConfig.runConfig,
@@ -625,6 +653,54 @@ export class SubagentManager {
   }
 
   /**
+   * When a subagent's model selector specifies a model (bare ID or
+   * authType-prefixed), build a Config override with a dedicated
+   * ContentGenerator so the model actually reaches the API.
+   * Returns the original context unchanged for inherit selectors.
+   */
+  private async maybeOverrideContentGenerator(
+    config: SubagentConfig,
+    base: Config,
+  ): Promise<Config> {
+    const selection = parseSubagentModelSelection(config.model);
+    if (selection.inherits) {
+      return base;
+    }
+
+    const authType =
+      selection.authType ?? base.getContentGeneratorConfig().authType;
+    const authOverrides = {
+      authType: authType as string,
+    };
+
+    const agentGeneratorConfig = buildAgentContentGeneratorConfig(
+      base,
+      selection.modelId,
+      authOverrides,
+    );
+
+    const agentGenerator = await createContentGenerator(
+      agentGeneratorConfig,
+      base,
+    );
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const override = Object.create(base) as any;
+    override.getContentGenerator = (): ContentGenerator => agentGenerator;
+    override.getContentGeneratorConfig = (): ContentGeneratorConfig =>
+      agentGeneratorConfig;
+    override.getAuthType = (): AuthType | undefined =>
+      agentGeneratorConfig.authType;
+    override.getModel = (): string => agentGeneratorConfig.model;
+
+    debugLogger.info(
+      `Created per-agent ContentGenerator for subagent "${config.name}": authType=${authType}, model=${agentGeneratorConfig.model}`,
+    );
+
+    return override as Config;
+  }
+
+  /**
    * Converts a file-based SubagentConfig to runtime configuration
    * compatible with AgentHeadless.create().
    *
@@ -632,25 +708,21 @@ export class SubagentManager {
    * @returns Runtime configuration for AgentHeadless
    */
   convertToRuntimeConfig(config: SubagentConfig): SubagentRuntimeConfig {
-    // Build prompt configuration
     const promptConfig: PromptConfig = {
       systemPrompt: config.systemPrompt,
     };
 
-    // Build model configuration
+    const selection = parseSubagentModelSelection(config.model);
     const modelConfig: ModelConfig = {
-      ...config.modelConfig,
+      ...(selection.modelId ? { model: selection.modelId } : {}),
     };
 
-    // Build run configuration
     const runConfig: RunConfig = {
       ...config.runConfig,
     };
 
-    // Build tool configuration if tools are specified
     let toolConfig: ToolConfig | undefined;
     if (config.tools && config.tools.length > 0) {
-      // Transform tools array to ensure all entries are tool names (not display names)
       const toolNames = this.transformToToolNames(config.tools);
       toolConfig = {
         tools: toolNames,
@@ -732,10 +804,6 @@ export class SubagentManager {
     return {
       ...base,
       ...updates,
-      // Handle nested objects specially
-      modelConfig: updates.modelConfig
-        ? { ...base.modelConfig, ...updates.modelConfig }
-        : base.modelConfig,
       runConfig: updates.runConfig
         ? { ...base.runConfig, ...updates.runConfig }
         : base.runConfig,
@@ -842,9 +910,9 @@ export class SubagentManager {
   ): Promise<SubagentConfig | null> {
     const allSubagents = await this.listSubagentsAtLevel(level);
 
-    // Find the subagent with matching name
+    const lowerName = name.toLowerCase();
     for (const subagent of allSubagents) {
-      if (subagent.name === name) {
+      if (subagent.name.toLowerCase() === lowerName) {
         return subagent;
       }
     }
@@ -948,13 +1016,20 @@ function parseSubagentContent(
 
     // Extract optional fields
     const tools = frontmatter['tools'] as string[] | undefined;
-    const modelConfig = frontmatter['modelConfig'] as
+    const modelRaw = frontmatter['model'];
+    const legacyModelConfig = frontmatter['modelConfig'] as
       | Record<string, unknown>
       | undefined;
     const runConfig = frontmatter['runConfig'] as
       | Record<string, unknown>
       | undefined;
     const color = frontmatter['color'] as string | undefined;
+    const model =
+      modelRaw != null && modelRaw !== ''
+        ? String(modelRaw)
+        : typeof legacyModelConfig?.['model'] === 'string'
+          ? legacyModelConfig['model']
+          : undefined;
 
     const config: SubagentConfig = {
       name,
@@ -962,7 +1037,7 @@ function parseSubagentContent(
       tools,
       systemPrompt: systemPrompt.trim(),
       filePath,
-      modelConfig: modelConfig as Partial<ModelConfig>,
+      model,
       runConfig: runConfig as Partial<RunConfig>,
       color,
       level,

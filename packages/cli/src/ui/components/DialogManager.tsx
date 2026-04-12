@@ -18,7 +18,8 @@ import { SettingsDialog } from './SettingsDialog.js';
 import { QwenOAuthProgress } from './QwenOAuthProgress.js';
 import { AuthDialog } from '../auth/AuthDialog.js';
 import { EditorSettingsDialog } from './EditorSettingsDialog.js';
-import { PermissionsModifyTrustDialog } from './PermissionsModifyTrustDialog.js';
+import { TrustDialog } from './TrustDialog.js';
+import { PermissionsDialog } from './PermissionsDialog.js';
 import { ModelDialog } from './ModelDialog.js';
 import { ArenaStartDialog } from './arena/ArenaStartDialog.js';
 import { ArenaSelectDialog } from './arena/ArenaSelectDialog.js';
@@ -40,6 +41,7 @@ import { AgentCreationWizard } from './subagents/create/AgentCreationWizard.js';
 import { AgentsManagerDialog } from './subagents/manage/AgentsManagerDialog.js';
 import { ExtensionsManagerDialog } from './extensions/ExtensionsManagerDialog.js';
 import { MCPManagementDialog } from './mcp/MCPManagementDialog.js';
+import { HooksManagementDialog } from './hooks/HooksManagementDialog.js';
 import { SessionPicker } from './SessionPicker.js';
 
 interface DialogManagerProps {
@@ -200,6 +202,14 @@ export const DialogManager = ({
       </Box>
     );
   }
+  if (uiState.isModelDialogOpen) {
+    return (
+      <ModelDialog
+        onClose={uiActions.closeModelDialog}
+        isFastModelMode={uiState.isFastModelMode}
+      />
+    );
+  }
   if (uiState.isSettingsDialogOpen) {
     return (
       <Box flexDirection="column">
@@ -212,6 +222,10 @@ export const DialogManager = ({
             }
             if (settingName === 'general.preferredEditor') {
               uiActions.openEditorDialog();
+              return;
+            }
+            if (settingName === 'fastModel') {
+              uiActions.openModelDialog({ fastModelMode: true });
               return;
             }
             uiActions.closeSettingsDialog();
@@ -237,9 +251,6 @@ export const DialogManager = ({
         />
       </Box>
     );
-  }
-  if (uiState.isModelDialogOpen) {
-    return <ModelDialog onClose={uiActions.closeModelDialog} />;
   }
   if (uiState.activeArenaDialog === 'start') {
     return (
@@ -314,13 +325,14 @@ export const DialogManager = ({
       );
     }
   }
-  if (uiState.isPermissionsDialogOpen) {
+  if (uiState.isTrustDialogOpen) {
     return (
-      <PermissionsModifyTrustDialog
-        onExit={uiActions.closePermissionsDialog}
-        addItem={addItem}
-      />
+      <TrustDialog onExit={uiActions.closeTrustDialog} addItem={addItem} />
     );
+  }
+
+  if (uiState.isPermissionsDialogOpen) {
+    return <PermissionsDialog onExit={uiActions.closePermissionsDialog} />;
   }
 
   if (uiState.isSubagentCreateDialogOpen) {
@@ -348,6 +360,9 @@ export const DialogManager = ({
         config={config}
       />
     );
+  }
+  if (uiState.isHooksDialogOpen) {
+    return <HooksManagementDialog onClose={uiActions.closeHooksDialog} />;
   }
   if (uiState.isMcpDialogOpen) {
     return <MCPManagementDialog onClose={uiActions.closeMcpDialog} />;

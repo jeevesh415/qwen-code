@@ -26,46 +26,17 @@ import { ToolCallEmitter } from './emitters/ToolCallEmitter.js';
 import { MessageEmitter } from './emitters/MessageEmitter.js';
 import type {
   AgentSideConnection,
-  PermissionOption,
   RequestPermissionRequest,
-  ToolCallContent,
 } from '@agentclientprotocol/sdk';
+import {
+  buildPermissionRequestContent,
+  toPermissionOptions,
+} from './permissionUtils.js';
 
 const debugLogger = createDebugLogger('ACP_SUBAGENT_TRACKER');
 
 /**
- * Permission option kind type matching ACP schema.
- */
-type PermissionKind =
-  | 'allow_once'
-  | 'reject_once'
-  | 'allow_always'
-  | 'reject_always';
-
-/**
- * Configuration for permission options displayed to users.
- */
-interface PermissionOptionConfig {
-  optionId: ToolConfirmationOutcome;
-  name: string;
-  kind: PermissionKind;
-}
-
-const basicPermissionOptions: readonly PermissionOptionConfig[] = [
-  {
-    optionId: ToolConfirmationOutcome.ProceedOnce,
-    name: 'Allow',
-    kind: 'allow_once',
-  },
-  {
-    optionId: ToolConfirmationOutcome.Cancel,
-    name: 'Reject',
-    kind: 'reject_once',
-  },
-] as const;
-
-/**
- * Tracks and emits events for sub-agent tool calls within TaskTool execution.
+ * Tracks and emits events for sub-agent tool calls within AgentTool execution.
  *
  * Uses the unified ToolCallEmitter for consistency with normal flow
  * and history replay. Also handles permission requests for tools that
@@ -106,7 +77,7 @@ export class SubAgentTracker {
   /**
    * Sets up event listeners for a sub-agent's tool events.
    *
-   * @param eventEmitter - The AgentEventEmitter from TaskTool
+   * @param eventEmitter - The AgentEventEmitter from AgentTool
    * @param abortSignal - Signal to abort tracking if parent is cancelled
    * @returns Array of cleanup functions to remove listeners
    */
@@ -219,23 +190,6 @@ export class SubAgentTracker {
       if (abortSignal.aborted) return;
 
       const state = this.toolStates.get(event.callId);
-      const content: ToolCallContent[] = [];
-
-      // Handle edit confirmation type - show diff
-      if (event.confirmationDetails.type === 'edit') {
-        const editDetails = event.confirmationDetails as unknown as {
-          type: 'edit';
-          fileName: string;
-          originalContent: string | null;
-          newContent: string;
-        };
-        content.push({
-          type: 'diff',
-          path: editDetails.fileName,
-          oldText: editDetails.originalContent ?? '',
-          newText: editDetails.newContent,
-        });
-      }
 
       // Build permission request
       const fullConfirmationDetails = {
@@ -250,12 +204,12 @@ export class SubAgentTracker {
 
       const params: RequestPermissionRequest = {
         sessionId: this.ctx.sessionId,
-        options: this.toPermissionOptions(fullConfirmationDetails),
+        options: toPermissionOptions(fullConfirmationDetails),
         toolCall: {
           toolCallId: event.callId,
           status: 'pending',
           title,
-          content,
+          content: buildPermissionRequestContent(fullConfirmationDetails),
           locations,
           kind,
           rawInput: state?.args,
@@ -273,7 +227,9 @@ export class SubAgentTracker {
                 .parse(output.outcome.optionId);
 
         // Respond to subagent with the outcome
-        await event.respond(outcome);
+        await event.respond(outcome, {
+          answers: 'answers' in output ? output.answers : undefined,
+        });
       } catch (error) {
         // If permission request fails, cancel the tool call
         debugLogger.error(
@@ -322,69 +278,5 @@ export class SubAgentTracker {
         event.thought ?? false,
       );
     };
-  }
-
-  /**
-   * Converts confirmation details to permission options for the client.
-   */
-  private toPermissionOptions(
-    confirmation: ToolCallConfirmationDetails,
-  ): PermissionOption[] {
-    switch (confirmation.type) {
-      case 'edit':
-        return [
-          {
-            optionId: ToolConfirmationOutcome.ProceedAlways,
-            name: 'Allow All Edits',
-            kind: 'allow_always',
-          },
-          ...basicPermissionOptions,
-        ];
-      case 'exec':
-        return [
-          {
-            optionId: ToolConfirmationOutcome.ProceedAlways,
-            name: `Always Allow ${(confirmation as { rootCommand?: string }).rootCommand ?? 'command'}`,
-            kind: 'allow_always',
-          },
-          ...basicPermissionOptions,
-        ];
-      case 'mcp':
-        return [
-          {
-            optionId: ToolConfirmationOutcome.ProceedAlwaysServer,
-            name: `Always Allow ${(confirmation as { serverName?: string }).serverName ?? 'server'}`,
-            kind: 'allow_always',
-          },
-          {
-            optionId: ToolConfirmationOutcome.ProceedAlwaysTool,
-            name: `Always Allow ${(confirmation as { toolName?: string }).toolName ?? 'tool'}`,
-            kind: 'allow_always',
-          },
-          ...basicPermissionOptions,
-        ];
-      case 'info':
-        return [
-          {
-            optionId: ToolConfirmationOutcome.ProceedAlways,
-            name: 'Always Allow',
-            kind: 'allow_always',
-          },
-          ...basicPermissionOptions,
-        ];
-      case 'plan':
-        return [
-          {
-            optionId: ToolConfirmationOutcome.ProceedAlways,
-            name: 'Always Allow Plans',
-            kind: 'allow_always',
-          },
-          ...basicPermissionOptions,
-        ];
-      default: {
-        // Fallback for unknown types
-        return [...basicPermissionOptions];
-      }
-    }
   }
 }

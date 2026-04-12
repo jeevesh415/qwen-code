@@ -15,6 +15,7 @@ import type {
   ToolResultDisplay,
   ToolRegistry,
 } from '../index.js';
+import type { PermissionDecision } from '../permissions/types.js';
 import {
   ApprovalMode,
   BaseDeclarativeTool,
@@ -34,16 +35,30 @@ import type { Part, PartListUnion } from '@google/genai';
 import {
   MockModifiableTool,
   MockTool,
-  MOCK_TOOL_SHOULD_CONFIRM_EXECUTE,
+  MOCK_TOOL_GET_DEFAULT_PERMISSION,
+  MOCK_TOOL_GET_CONFIRMATION_DETAILS,
 } from '../test-utils/mock-tool.js';
 import { MessageBusType } from '../confirmation-bus/types.js';
 import type { HookExecutionResponse } from '../confirmation-bus/types.js';
 import { type NotificationType } from '../hooks/types.js';
 import type { MessageBus } from '../confirmation-bus/message-bus.js';
+import { IdeClient } from '../ide/ide-client.js';
 
 vi.mock('fs/promises', () => ({
   writeFile: vi.fn(),
 }));
+
+vi.mock('../ide/ide-client.js', () => ({
+  IdeClient: {
+    getInstance: vi.fn(),
+  },
+}));
+
+const mockIdeClient = {
+  openDiff: vi.fn(),
+  isDiffingEnabled: vi.fn(),
+  closeDiff: vi.fn(),
+};
 
 class TestApprovalTool extends BaseDeclarativeTool<{ id: string }, ToolResult> {
   static readonly Name = 'testApprovalTool';
@@ -84,14 +99,14 @@ class TestApprovalInvocation extends BaseToolInvocation<
     return `Test tool ${this.params.id}`;
   }
 
-  override async shouldConfirmExecute(): Promise<
-    ToolCallConfirmationDetails | false
-  > {
-    // Need confirmation unless approval mode is AUTO_EDIT
+  override async getDefaultPermission(): Promise<PermissionDecision> {
     if (this.config.getApprovalMode() === ApprovalMode.AUTO_EDIT) {
-      return false;
+      return 'allow';
     }
+    return 'ask';
+  }
 
+  override async getConfirmationDetails(): Promise<ToolCallConfirmationDetails> {
     return {
       type: 'edit',
       title: `Confirm Test Tool ${this.params.id}`,
@@ -128,9 +143,13 @@ class AbortDuringConfirmationInvocation extends BaseToolInvocation<
     super(params);
   }
 
-  override async shouldConfirmExecute(
+  override async getDefaultPermission(): Promise<PermissionDecision> {
+    return 'ask';
+  }
+
+  override async getConfirmationDetails(
     _signal: AbortSignal,
-  ): Promise<ToolCallConfirmationDetails | false> {
+  ): Promise<ToolCallConfirmationDetails> {
     this.abortController.abort();
     throw this.abortError;
   }
@@ -214,7 +233,8 @@ describe('CoreToolScheduler', () => {
   it('should cancel a tool call if the signal is aborted before confirmation', async () => {
     const mockTool = new MockTool({
       name: 'mockTool',
-      shouldConfirmExecute: MOCK_TOOL_SHOULD_CONFIRM_EXECUTE,
+      getDefaultPermission: MOCK_TOOL_GET_DEFAULT_PERMISSION,
+      getConfirmationDetails: MOCK_TOOL_GET_CONFIRMATION_DETAILS,
     });
     const declarativeTool = mockTool;
     const mockToolRegistry = {
@@ -239,7 +259,7 @@ describe('CoreToolScheduler', () => {
       getUsageStatisticsEnabled: () => true,
       getDebugMode: () => false,
       getApprovalMode: () => ApprovalMode.DEFAULT,
-      getAllowedTools: () => [],
+      getPermissionsAllow: () => [],
       getContentGeneratorConfig: () => ({
         model: 'test-model',
         authType: 'gemini',
@@ -259,7 +279,7 @@ describe('CoreToolScheduler', () => {
       getGeminiClient: () => null, // No client needed for these tests
       getChatRecordingService: () => undefined,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     const scheduler = new CoreToolScheduler({
@@ -318,7 +338,7 @@ describe('CoreToolScheduler', () => {
       getUsageStatisticsEnabled: () => true,
       getDebugMode: () => false,
       getApprovalMode: () => ApprovalMode.DEFAULT,
-      getAllowedTools: () => [],
+      getPermissionsAllow: () => [],
       getContentGeneratorConfig: () => ({
         model: 'test-model',
         authType: 'gemini',
@@ -338,7 +358,7 @@ describe('CoreToolScheduler', () => {
       getGeminiClient: () => null,
       getChatRecordingService: () => undefined,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     const scheduler = new CoreToolScheduler({
@@ -380,10 +400,10 @@ describe('CoreToolScheduler', () => {
         getToolRegistry: () => mockToolRegistry,
         getUseModelRouter: () => false,
         getGeminiClient: () => null, // No client needed for these tests
-        getExcludeTools: () => undefined,
+        getPermissionsDeny: () => undefined,
         isInteractive: () => true,
         getMessageBus: vi.fn().mockReturnValue(undefined),
-        getEnableHooks: vi.fn().mockReturnValue(false),
+        getDisableAllHooks: vi.fn().mockReturnValue(true),
       } as unknown as Config;
 
       // Create scheduler
@@ -423,10 +443,10 @@ describe('CoreToolScheduler', () => {
         getToolRegistry: () => mockToolRegistry,
         getUseModelRouter: () => false,
         getGeminiClient: () => null,
-        getExcludeTools: () => ['write_file', 'edit', 'run_shell_command'],
+        getPermissionsDeny: () => ['write_file', 'edit', 'run_shell_command'],
         isInteractive: () => false, // Value doesn't matter, but included for completeness
         getMessageBus: vi.fn().mockReturnValue(undefined),
-        getEnableHooks: vi.fn().mockReturnValue(false),
+        getDisableAllHooks: vi.fn().mockReturnValue(true),
       } as unknown as Config;
 
       // Create scheduler
@@ -455,10 +475,10 @@ describe('CoreToolScheduler', () => {
         getToolRegistry: () => mockToolRegistry,
         getUseModelRouter: () => false,
         getGeminiClient: () => null,
-        getExcludeTools: () => ['write_file', 'edit'],
+        getPermissionsDeny: () => ['write_file', 'edit'],
         isInteractive: () => false, // Value doesn't matter
         getMessageBus: vi.fn().mockReturnValue(undefined),
-        getEnableHooks: vi.fn().mockReturnValue(false),
+        getDisableAllHooks: vi.fn().mockReturnValue(true),
       } as unknown as Config;
 
       // Create scheduler
@@ -498,10 +518,10 @@ describe('CoreToolScheduler', () => {
         getToolRegistry: () => mockToolRegistry,
         getUseModelRouter: () => false,
         getGeminiClient: () => null,
-        getExcludeTools: () => undefined,
+        getPermissionsDeny: () => undefined,
         isInteractive: () => true,
         getMessageBus: vi.fn().mockReturnValue(undefined),
-        getEnableHooks: vi.fn().mockReturnValue(false),
+        getDisableAllHooks: vi.fn().mockReturnValue(true),
       } as unknown as Config;
 
       // Create scheduler
@@ -560,8 +580,8 @@ describe('CoreToolScheduler', () => {
         getUsageStatisticsEnabled: () => true,
         getDebugMode: () => false,
         getApprovalMode: () => ApprovalMode.DEFAULT,
-        getAllowedTools: () => [],
-        getExcludeTools: () => ['write_file', 'edit', 'run_shell_command'],
+        getPermissionsAllow: () => [],
+        getPermissionsDeny: () => ['write_file', 'edit', 'run_shell_command'],
         getContentGeneratorConfig: () => ({
           model: 'test-model',
           authType: 'gemini',
@@ -581,7 +601,7 @@ describe('CoreToolScheduler', () => {
         getGeminiClient: () => null,
         getChatRecordingService: () => undefined,
         getMessageBus: vi.fn().mockReturnValue(undefined),
-        getEnableHooks: vi.fn().mockReturnValue(false),
+        getDisableAllHooks: vi.fn().mockReturnValue(true),
       } as unknown as Config;
 
       const scheduler = new CoreToolScheduler({
@@ -648,8 +668,8 @@ describe('CoreToolScheduler', () => {
         getUsageStatisticsEnabled: () => true,
         getDebugMode: () => false,
         getApprovalMode: () => ApprovalMode.DEFAULT,
-        getAllowedTools: () => [],
-        getExcludeTools: () => ['write_file', 'edit'], // Different excluded tools
+        getPermissionsAllow: () => [],
+        getPermissionsDeny: () => ['write_file', 'edit'], // Different excluded tools
         getContentGeneratorConfig: () => ({
           model: 'test-model',
           authType: 'gemini',
@@ -669,7 +689,7 @@ describe('CoreToolScheduler', () => {
         getGeminiClient: () => null,
         getChatRecordingService: () => undefined,
         getMessageBus: vi.fn().mockReturnValue(undefined),
-        getEnableHooks: vi.fn().mockReturnValue(false),
+        getDisableAllHooks: vi.fn().mockReturnValue(true),
       } as unknown as Config;
 
       const scheduler = new CoreToolScheduler({
@@ -740,7 +760,7 @@ describe('CoreToolScheduler with payload', () => {
       getUsageStatisticsEnabled: () => true,
       getDebugMode: () => false,
       getApprovalMode: () => ApprovalMode.DEFAULT,
-      getAllowedTools: () => [],
+      getPermissionsAllow: () => [],
       getContentGeneratorConfig: () => ({
         model: 'test-model',
         authType: 'gemini',
@@ -763,7 +783,7 @@ describe('CoreToolScheduler with payload', () => {
       getExperimentalZedIntegration: () => false,
       getChatRecordingService: () => undefined,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     const scheduler = new CoreToolScheduler({
@@ -1017,9 +1037,13 @@ class MockEditToolInvocation extends BaseToolInvocation<
     return 'A mock edit tool invocation';
   }
 
-  override async shouldConfirmExecute(
+  override async getDefaultPermission(): Promise<PermissionDecision> {
+    return 'ask';
+  }
+
+  override async getConfirmationDetails(
     _abortSignal: AbortSignal,
-  ): Promise<ToolCallConfirmationDetails | false> {
+  ): Promise<ToolCallConfirmationDetails> {
     return {
       type: 'edit',
       title: 'Confirm Edit',
@@ -1081,7 +1105,7 @@ describe('CoreToolScheduler edit cancellation', () => {
       getUsageStatisticsEnabled: () => true,
       getDebugMode: () => false,
       getApprovalMode: () => ApprovalMode.DEFAULT,
-      getAllowedTools: () => [],
+      getPermissionsAllow: () => [],
       getContentGeneratorConfig: () => ({
         model: 'test-model',
         authType: 'gemini',
@@ -1101,7 +1125,7 @@ describe('CoreToolScheduler edit cancellation', () => {
       getExperimentalZedIntegration: () => false,
       getChatRecordingService: () => undefined,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     const scheduler = new CoreToolScheduler({
@@ -1161,7 +1185,8 @@ describe('CoreToolScheduler YOLO mode', () => {
     const mockTool = new MockTool({
       name: 'mockTool',
       execute: executeFn,
-      shouldConfirmExecute: MOCK_TOOL_SHOULD_CONFIRM_EXECUTE,
+      getDefaultPermission: MOCK_TOOL_GET_DEFAULT_PERMISSION,
+      getConfirmationDetails: MOCK_TOOL_GET_CONFIRMATION_DETAILS,
     });
     const declarativeTool = mockTool;
 
@@ -1189,7 +1214,7 @@ describe('CoreToolScheduler YOLO mode', () => {
       getUsageStatisticsEnabled: () => true,
       getDebugMode: () => false,
       getApprovalMode: () => ApprovalMode.YOLO,
-      getAllowedTools: () => [],
+      getPermissionsAllow: () => [],
       getContentGeneratorConfig: () => ({
         model: 'test-model',
         authType: 'gemini',
@@ -1209,7 +1234,7 @@ describe('CoreToolScheduler YOLO mode', () => {
       getGeminiClient: () => null, // No client needed for these tests
       getChatRecordingService: () => undefined,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     const scheduler = new CoreToolScheduler({
@@ -1352,7 +1377,7 @@ describe('CoreToolScheduler cancellation during executing with live output', () 
       }),
       getChatRecordingService: () => undefined,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     const scheduler = new CoreToolScheduler({
@@ -1434,7 +1459,7 @@ describe('CoreToolScheduler request queueing', () => {
       getUsageStatisticsEnabled: () => true,
       getDebugMode: () => false,
       getApprovalMode: () => ApprovalMode.YOLO, // Use YOLO to avoid confirmation prompts
-      getAllowedTools: () => [],
+      getPermissionsAllow: () => [],
       getContentGeneratorConfig: () => ({
         model: 'test-model',
         authType: 'gemini',
@@ -1454,7 +1479,7 @@ describe('CoreToolScheduler request queueing', () => {
       getGeminiClient: () => null, // No client needed for these tests
       getChatRecordingService: () => undefined,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     const scheduler = new CoreToolScheduler({
@@ -1530,120 +1555,6 @@ describe('CoreToolScheduler request queueing', () => {
     expect(onAllToolCallsComplete.mock.calls[1][0][0].status).toBe('success');
   });
 
-  it('should auto-approve a tool call if it is on the allowedTools list', async () => {
-    // Arrange
-    const executeFn = vi.fn().mockResolvedValue({
-      llmContent: 'Tool executed',
-      returnDisplay: 'Tool executed',
-    });
-    const mockTool = new MockTool({
-      name: 'mockTool',
-      execute: executeFn,
-      shouldConfirmExecute: MOCK_TOOL_SHOULD_CONFIRM_EXECUTE,
-    });
-    const declarativeTool = mockTool;
-
-    const toolRegistry = {
-      getTool: () => declarativeTool,
-      getToolByName: () => declarativeTool,
-      getFunctionDeclarations: () => [],
-      tools: new Map(),
-      discovery: {},
-      registerTool: () => {},
-      getToolByDisplayName: () => declarativeTool,
-      getTools: () => [],
-      discoverTools: async () => {},
-      getAllTools: () => [],
-      getToolsByServer: () => [],
-    } as unknown as ToolRegistry;
-
-    const onAllToolCallsComplete = vi.fn();
-    const onToolCallsUpdate = vi.fn();
-
-    // Configure the scheduler to auto-approve the specific tool call.
-    const mockConfig = {
-      getSessionId: () => 'test-session-id',
-      getUsageStatisticsEnabled: () => true,
-      getDebugMode: () => false,
-      getApprovalMode: () => ApprovalMode.DEFAULT, // Not YOLO mode
-      getAllowedTools: () => ['mockTool'], // Auto-approve this tool
-      getToolRegistry: () => toolRegistry,
-      getContentGeneratorConfig: () => ({
-        model: 'test-model',
-        authType: 'gemini',
-      }),
-      getShellExecutionConfig: () => ({
-        terminalWidth: 80,
-        terminalHeight: 24,
-      }),
-      getTerminalWidth: vi.fn(() => 80),
-      getTerminalHeight: vi.fn(() => 24),
-      storage: {
-        getProjectTempDir: () => '/tmp',
-      },
-      getTruncateToolOutputThreshold: () =>
-        DEFAULT_TRUNCATE_TOOL_OUTPUT_THRESHOLD,
-      getTruncateToolOutputLines: () => DEFAULT_TRUNCATE_TOOL_OUTPUT_LINES,
-      getUseModelRouter: () => false,
-      getGeminiClient: () => null, // No client needed for these tests
-      getChatRecordingService: () => undefined,
-      getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
-    } as unknown as Config;
-
-    const scheduler = new CoreToolScheduler({
-      config: mockConfig,
-      onAllToolCallsComplete,
-      onToolCallsUpdate,
-      getPreferredEditor: () => 'vscode',
-      onEditorClose: vi.fn(),
-    });
-
-    const abortController = new AbortController();
-    const request = {
-      callId: '1',
-      name: 'mockTool',
-      args: { param: 'value' },
-      isClientInitiated: false,
-      prompt_id: 'prompt-auto-approved',
-    };
-
-    // Act
-    await scheduler.schedule([request], abortController.signal);
-
-    // Wait for the tool execution to complete
-    await vi.waitFor(() => {
-      expect(onAllToolCallsComplete).toHaveBeenCalled();
-    });
-
-    // Assert
-    // 1. The tool's execute method was called directly.
-    expect(executeFn).toHaveBeenCalledWith({ param: 'value' });
-
-    // 2. The tool call status never entered 'awaiting_approval'.
-    const statusUpdates = onToolCallsUpdate.mock.calls
-      .map((call) => (call[0][0] as ToolCall)?.status)
-      .filter(Boolean);
-    expect(statusUpdates).not.toContain('awaiting_approval');
-    expect(statusUpdates).toEqual([
-      'validating',
-      'scheduled',
-      'executing',
-      'success',
-    ]);
-
-    // 3. The final callback indicates the tool call was successful.
-    expect(onAllToolCallsComplete).toHaveBeenCalled();
-    const completedCalls = onAllToolCallsComplete.mock
-      .calls[0][0] as ToolCall[];
-    expect(completedCalls).toHaveLength(1);
-    const completedCall = completedCalls[0];
-    expect(completedCall.status).toBe('success');
-    if (completedCall.status === 'success') {
-      expect(completedCall.response.resultDisplay).toBe('Tool executed');
-    }
-  });
-
   it('should handle two synchronous calls to schedule', async () => {
     const executeFn = vi.fn().mockResolvedValue({
       llmContent: 'Tool executed',
@@ -1672,7 +1583,7 @@ describe('CoreToolScheduler request queueing', () => {
       getUsageStatisticsEnabled: () => true,
       getDebugMode: () => false,
       getApprovalMode: () => ApprovalMode.YOLO,
-      getAllowedTools: () => [],
+      getPermissionsAllow: () => [],
       getContentGeneratorConfig: () => ({
         model: 'test-model',
         authType: 'gemini',
@@ -1692,7 +1603,7 @@ describe('CoreToolScheduler request queueing', () => {
       getGeminiClient: () => null, // No client needed for these tests
       getChatRecordingService: () => undefined,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     const scheduler = new CoreToolScheduler({
@@ -1748,7 +1659,7 @@ describe('CoreToolScheduler request queueing', () => {
       getUsageStatisticsEnabled: () => true,
       getDebugMode: () => false,
       getApprovalMode: () => approvalMode,
-      getAllowedTools: () => [],
+      getPermissionsAllow: () => [],
       setApprovalMode: (mode: ApprovalMode) => {
         approvalMode = mode;
       },
@@ -1769,7 +1680,7 @@ describe('CoreToolScheduler request queueing', () => {
       getExperimentalZedIntegration: () => false,
       getChatRecordingService: () => undefined,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     const testTool = new TestApprovalTool(mockConfig);
@@ -1912,8 +1823,8 @@ describe('CoreToolScheduler truncated output protection', () => {
       getUsageStatisticsEnabled: () => true,
       getDebugMode: () => false,
       getApprovalMode: () => ApprovalMode.AUTO_EDIT,
-      getAllowedTools: () => [],
-      getExcludeTools: () => undefined,
+      getPermissionsAllow: () => [],
+      getPermissionsDeny: () => undefined,
       getContentGeneratorConfig: () => ({
         model: 'test-model',
         authType: 'gemini',
@@ -1934,7 +1845,7 @@ describe('CoreToolScheduler truncated output protection', () => {
       getChatRecordingService: () => undefined,
       isInteractive: () => true,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     const scheduler = new CoreToolScheduler({
@@ -2113,7 +2024,7 @@ describe('CoreToolScheduler Sequential Execution', () => {
       getUsageStatisticsEnabled: () => true,
       getDebugMode: () => false,
       getApprovalMode: () => ApprovalMode.YOLO, // Use YOLO to avoid confirmation prompts
-      getAllowedTools: () => [],
+      getPermissionsAllow: () => [],
       getContentGeneratorConfig: () => ({
         model: 'test-model',
         authType: 'gemini',
@@ -2133,7 +2044,7 @@ describe('CoreToolScheduler Sequential Execution', () => {
       getGeminiClient: () => null,
       getChatRecordingService: () => undefined,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     const scheduler = new CoreToolScheduler({
@@ -2235,7 +2146,7 @@ describe('CoreToolScheduler Sequential Execution', () => {
       getUsageStatisticsEnabled: () => true,
       getDebugMode: () => false,
       getApprovalMode: () => ApprovalMode.YOLO,
-      getAllowedTools: () => [],
+      getPermissionsAllow: () => [],
       getContentGeneratorConfig: () => ({
         model: 'test-model',
         authType: 'gemini',
@@ -2255,7 +2166,7 @@ describe('CoreToolScheduler Sequential Execution', () => {
       getGeminiClient: () => null,
       getChatRecordingService: () => undefined,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     const scheduler = new CoreToolScheduler({
@@ -2336,7 +2247,8 @@ describe('CoreToolScheduler plan mode with ask_user_question', () => {
 
     return new MockTool({
       name: 'ask_user_question',
-      shouldConfirmExecute: async () => ({
+      getDefaultPermission: async () => 'ask',
+      getConfirmationDetails: async () => ({
         type: 'ask_user_question' as const,
         title: 'Please answer the following question(s):',
         questions: [
@@ -2407,7 +2319,7 @@ describe('CoreToolScheduler plan mode with ask_user_question', () => {
       getUsageStatisticsEnabled: () => true,
       getDebugMode: () => false,
       getApprovalMode: () => ApprovalMode.PLAN,
-      getAllowedTools: () => [],
+      getPermissionsAllow: () => [],
       getContentGeneratorConfig: () => ({
         model: 'test-model',
         authType: 'gemini',
@@ -2430,7 +2342,7 @@ describe('CoreToolScheduler plan mode with ask_user_question', () => {
       getExperimentalZedIntegration: () => false,
       getChatRecordingService: () => undefined,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     return new CoreToolScheduler({
@@ -2545,7 +2457,8 @@ describe('CoreToolScheduler plan mode with ask_user_question', () => {
   it('should block non-ask_user_question tools that need confirmation in plan mode', async () => {
     const editTool = new MockTool({
       name: 'write_file',
-      shouldConfirmExecute: MOCK_TOOL_SHOULD_CONFIRM_EXECUTE,
+      getDefaultPermission: MOCK_TOOL_GET_DEFAULT_PERMISSION,
+      getConfirmationDetails: MOCK_TOOL_GET_CONFIRMATION_DETAILS,
     });
     const onAllToolCallsComplete = vi.fn();
     const onToolCallsUpdate = vi.fn();
@@ -2578,6 +2491,70 @@ describe('CoreToolScheduler plan mode with ask_user_question', () => {
         'Plan mode blocked a non-read-only tool call.',
       );
     }
+  });
+
+  it('should allow info confirmation tools in plan mode after approval', async () => {
+    const onConfirmSpy = vi.fn().mockResolvedValue(undefined);
+    const infoTool = new MockTool({
+      name: 'web_fetch',
+      getDefaultPermission: async () => 'ask',
+      getConfirmationDetails: async () => ({
+        type: 'info' as const,
+        title: 'Confirm Web Fetch',
+        prompt: 'Fetch https://example.com/docs',
+        urls: ['https://example.com/docs'],
+        onConfirm: onConfirmSpy,
+      }),
+      execute: async () => ({
+        llmContent: 'Fetched docs',
+        returnDisplay: 'Fetched docs',
+      }),
+    });
+    const onAllToolCallsComplete = vi.fn();
+    const onToolCallsUpdate = vi.fn();
+    const scheduler = createPlanModeScheduler(
+      infoTool,
+      onAllToolCallsComplete,
+      onToolCallsUpdate,
+    );
+
+    const abortController = new AbortController();
+    const request = {
+      callId: '1',
+      name: 'web_fetch',
+      args: {
+        url: 'https://example.com/docs',
+        prompt: 'Summarize the API docs',
+      },
+      isClientInitiated: false,
+      prompt_id: 'prompt-plan-info',
+    };
+
+    await scheduler.schedule([request], abortController.signal);
+
+    const awaitingCall = (await waitForStatus(
+      onToolCallsUpdate,
+      'awaiting_approval',
+    )) as WaitingToolCall;
+
+    expect(awaitingCall.confirmationDetails.type).toBe('info');
+
+    await awaitingCall.confirmationDetails.onConfirm(
+      ToolConfirmationOutcome.ProceedOnce,
+    );
+
+    await vi.waitFor(() => {
+      expect(onAllToolCallsComplete).toHaveBeenCalled();
+    });
+
+    expect(onConfirmSpy).toHaveBeenCalledWith(
+      ToolConfirmationOutcome.ProceedOnce,
+      undefined,
+    );
+
+    const completedCalls = onAllToolCallsComplete.mock
+      .calls[0][0] as ToolCall[];
+    expect(completedCalls[0].status).toBe('success');
   });
 
   it('should handle user cancellation of ask_user_question in plan mode', async () => {
@@ -3027,7 +3004,7 @@ describe('Fire hook functions integration', () => {
     });
   });
 
-  describe('Concurrent task tool execution', () => {
+  describe('Concurrent agent tool execution', () => {
     function createScheduler(
       tools: Map<string, MockTool>,
       onAllToolCallsComplete: Mock,
@@ -3072,7 +3049,7 @@ describe('Fire hook functions integration', () => {
         getGeminiClient: () => null,
         getChatRecordingService: () => undefined,
         getMessageBus: vi.fn().mockReturnValue(undefined),
-        getEnableHooks: vi.fn().mockReturnValue(false),
+        getDisableAllHooks: vi.fn().mockReturnValue(true),
       } as unknown as Config;
 
       return new CoreToolScheduler({
@@ -3084,25 +3061,25 @@ describe('Fire hook functions integration', () => {
       });
     }
 
-    it('should execute multiple task tools concurrently', async () => {
+    it('should execute multiple agent tools concurrently', async () => {
       const executionLog: string[] = [];
 
-      const taskTool = new MockTool({
-        name: 'task',
+      const agentTool = new MockTool({
+        name: 'agent',
         execute: async (params) => {
           const id = (params as { id: string }).id;
           executionLog.push(`start:${id}`);
-          // Simulate async work — concurrent tasks will interleave here
+          // Simulate async work — concurrent agents will interleave here
           await new Promise((r) => setTimeout(r, 50));
           executionLog.push(`end:${id}`);
           return {
-            llmContent: `Task ${id} done`,
-            returnDisplay: `Task ${id} done`,
+            llmContent: `Agent ${id} done`,
+            returnDisplay: `Agent ${id} done`,
           };
         },
       });
 
-      const tools = new Map([['task', taskTool]]);
+      const tools = new Map([['agent', agentTool]]);
       const onAllToolCallsComplete = vi.fn();
       const onToolCallsUpdate = vi.fn();
       const scheduler = createScheduler(
@@ -3115,21 +3092,21 @@ describe('Fire hook functions integration', () => {
       const requests = [
         {
           callId: '1',
-          name: 'task',
+          name: 'agent',
           args: { id: 'A' },
           isClientInitiated: false,
           prompt_id: 'p1',
         },
         {
           callId: '2',
-          name: 'task',
+          name: 'agent',
           args: { id: 'B' },
           isClientInitiated: false,
           prompt_id: 'p1',
         },
         {
           callId: '3',
-          name: 'task',
+          name: 'agent',
           args: { id: 'C' },
           isClientInitiated: false,
           prompt_id: 'p1',
@@ -3138,14 +3115,14 @@ describe('Fire hook functions integration', () => {
 
       await scheduler.schedule(requests, abortController.signal);
 
-      // All tasks should have completed
+      // All agents should have completed
       expect(onAllToolCallsComplete).toHaveBeenCalled();
       const completedCalls = onAllToolCallsComplete.mock
         .calls[0][0] as ToolCall[];
       expect(completedCalls).toHaveLength(3);
       expect(completedCalls.every((c) => c.status === 'success')).toBe(true);
 
-      // Verify concurrency: all tasks should start before any finishes
+      // Verify concurrency: all agents should start before any finishes
       // With sequential execution, the log would be [start:A, end:A, start:B, end:B, ...]
       // With concurrent execution, all starts happen before any end
       const startIndices = executionLog
@@ -3155,19 +3132,19 @@ describe('Fire hook functions integration', () => {
       expect(startIndices.every((i) => i < firstEnd)).toBe(true);
     });
 
-    it('should run task tools concurrently while other tools run sequentially', async () => {
+    it('should run agent tools concurrently while other tools run sequentially', async () => {
       const executionLog: string[] = [];
 
-      const taskTool = new MockTool({
-        name: 'task',
+      const agentTool = new MockTool({
+        name: 'agent',
         execute: async (params) => {
           const id = (params as { id: string }).id;
-          executionLog.push(`task:start:${id}`);
+          executionLog.push(`agent:start:${id}`);
           await new Promise((r) => setTimeout(r, 50));
-          executionLog.push(`task:end:${id}`);
+          executionLog.push(`agent:end:${id}`);
           return {
-            llmContent: `Task ${id} done`,
-            returnDisplay: `Task ${id} done`,
+            llmContent: `Agent ${id} done`,
+            returnDisplay: `Agent ${id} done`,
           };
         },
       });
@@ -3187,7 +3164,7 @@ describe('Fire hook functions integration', () => {
       });
 
       const tools = new Map<string, MockTool>([
-        ['task', taskTool],
+        ['agent', agentTool],
         ['read_file', readTool],
       ]);
       const onAllToolCallsComplete = vi.fn();
@@ -3209,7 +3186,7 @@ describe('Fire hook functions integration', () => {
         },
         {
           callId: '2',
-          name: 'task',
+          name: 'agent',
           args: { id: 'A' },
           isClientInitiated: false,
           prompt_id: 'p1',
@@ -3223,7 +3200,7 @@ describe('Fire hook functions integration', () => {
         },
         {
           callId: '4',
-          name: 'task',
+          name: 'agent',
           args: { id: 'B' },
           isClientInitiated: false,
           prompt_id: 'p1',
@@ -3238,20 +3215,415 @@ describe('Fire hook functions integration', () => {
       expect(completedCalls).toHaveLength(4);
       expect(completedCalls.every((c) => c.status === 'success')).toBe(true);
 
-      // Non-task tools should execute sequentially: read:1 finishes before read:2 starts
+      // Non-agent tools should execute sequentially: read:1 finishes before read:2 starts
       const read1End = executionLog.indexOf('read:end:1');
       const read2Start = executionLog.indexOf('read:start:2');
       expect(read1End).toBeLessThan(read2Start);
 
-      // Task tools should execute concurrently: both start before either ends
-      const taskAStart = executionLog.indexOf('task:start:A');
-      const taskBStart = executionLog.indexOf('task:start:B');
-      const firstTaskEnd = Math.min(
-        executionLog.indexOf('task:end:A'),
-        executionLog.indexOf('task:end:B'),
+      // Agent tools should execute concurrently: both start before either ends
+      const agentAStart = executionLog.indexOf('agent:start:A');
+      const agentBStart = executionLog.indexOf('agent:start:B');
+      const firstAgentEnd = Math.min(
+        executionLog.indexOf('agent:end:A'),
+        executionLog.indexOf('agent:end:B'),
       );
-      expect(taskAStart).toBeLessThan(firstTaskEnd);
-      expect(taskBStart).toBeLessThan(firstTaskEnd);
+      expect(agentAStart).toBeLessThan(firstAgentEnd);
+      expect(agentBStart).toBeLessThan(firstAgentEnd);
     });
+  });
+});
+
+describe('CoreToolScheduler IDE interaction', () => {
+  function createIdeMockConfig(
+    overrides: {
+      approvalMode?: ApprovalMode;
+      ideMode?: boolean;
+    } = {},
+  ) {
+    const mockModifiableTool = new MockModifiableTool();
+    mockModifiableTool.executeFn = vi.fn();
+
+    const mockToolRegistry = {
+      getTool: () => mockModifiableTool,
+      getFunctionDeclarations: () => [],
+      tools: new Map(),
+      discovery: {},
+      registerTool: () => {},
+      getToolByName: () => mockModifiableTool,
+      getToolByDisplayName: () => mockModifiableTool,
+      getTools: () => [],
+      discoverTools: async () => {},
+      getAllTools: () => [],
+      getToolsByServer: () => [],
+    } as unknown as ToolRegistry;
+
+    const mockConfig = {
+      getSessionId: () => 'test-session-id',
+      getUsageStatisticsEnabled: () => true,
+      getDebugMode: () => false,
+      getApprovalMode: () => overrides.approvalMode ?? ApprovalMode.DEFAULT,
+      getPermissionsAllow: () => [],
+      getContentGeneratorConfig: () => ({
+        model: 'test-model',
+        authType: 'gemini',
+      }),
+      getShellExecutionConfig: () => ({
+        terminalWidth: 90,
+        terminalHeight: 30,
+      }),
+      storage: {
+        getProjectTempDir: () => '/tmp',
+      },
+      getTruncateToolOutputThreshold: () =>
+        DEFAULT_TRUNCATE_TOOL_OUTPUT_THRESHOLD,
+      getTruncateToolOutputLines: () => DEFAULT_TRUNCATE_TOOL_OUTPUT_LINES,
+      getToolRegistry: () => mockToolRegistry,
+      getUseModelRouter: () => false,
+      getGeminiClient: () => null,
+      isInteractive: () => true,
+      getIdeMode: () => overrides.ideMode ?? true,
+      getExperimentalZedIntegration: () => false,
+      getChatRecordingService: () => undefined,
+      getMessageBus: vi.fn().mockReturnValue(undefined),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
+      setApprovalMode: vi.fn(),
+    } as unknown as Config;
+
+    return { mockConfig, mockModifiableTool, mockToolRegistry };
+  }
+
+  beforeEach(() => {
+    vi.mocked(IdeClient.getInstance).mockResolvedValue(
+      mockIdeClient as unknown as IdeClient,
+    );
+    mockIdeClient.isDiffingEnabled.mockReturnValue(true);
+    mockIdeClient.openDiff.mockReset();
+  });
+
+  it('should safely update args via _applyInlineModify when IDE returns modified content (#2709)', async () => {
+    const { mockConfig, mockModifiableTool } = createIdeMockConfig({
+      ideMode: true,
+    });
+
+    // IDE returns accepted with modified content
+    mockIdeClient.openDiff.mockResolvedValue({
+      status: 'accepted',
+      content: 'IDE-modified content',
+    });
+
+    const onAllToolCallsComplete = vi.fn();
+    const onToolCallsUpdate = vi.fn();
+
+    const scheduler = new CoreToolScheduler({
+      config: mockConfig,
+      onAllToolCallsComplete,
+      onToolCallsUpdate,
+      getPreferredEditor: () => 'vscode',
+      onEditorClose: vi.fn(),
+    });
+
+    const originalArgs = { param: 'original-value' };
+    const request = {
+      callId: 'ide-1',
+      name: 'mockModifiableTool',
+      args: originalArgs,
+      isClientInitiated: false,
+      prompt_id: 'prompt-ide-1',
+    };
+
+    const abortController = new AbortController();
+    await scheduler.schedule([request], abortController.signal);
+
+    // Wait for the tool to complete (IDE auto-confirms)
+    await vi.waitFor(() => {
+      expect(onAllToolCallsComplete).toHaveBeenCalled();
+    });
+
+    const completedCalls = onAllToolCallsComplete.mock
+      .calls[0][0] as ToolCall[];
+    expect(completedCalls[0].status).toBe('success');
+
+    // The tool should have been executed with the IDE-modified content
+    // via _applyInlineModify -> createUpdatedParams -> setArgsInternal
+    expect(mockModifiableTool.executeFn).toHaveBeenCalledWith({
+      newContent: 'IDE-modified content',
+    });
+
+    // CRITICAL: The original args object should NOT have been mutated (#2709)
+    expect(originalArgs).toEqual({ param: 'original-value' });
+    // The request.args (which is what goes into history) should also be safe.
+    // structuredClone in buildInvocation ensures the tool gets its own copy.
+    expect(request.args).toEqual({ param: 'original-value' });
+  });
+
+  it('should NOT call openDiff when AUTO_EDIT mode is active (#2673)', async () => {
+    const { mockConfig, mockModifiableTool } = createIdeMockConfig({
+      approvalMode: ApprovalMode.AUTO_EDIT,
+      ideMode: true,
+    });
+
+    mockModifiableTool.shouldConfirm = false; // AUTO_EDIT returns 'allow'
+
+    const onAllToolCallsComplete = vi.fn();
+    const onToolCallsUpdate = vi.fn();
+
+    const scheduler = new CoreToolScheduler({
+      config: mockConfig,
+      onAllToolCallsComplete,
+      onToolCallsUpdate,
+      getPreferredEditor: () => 'vscode',
+      onEditorClose: vi.fn(),
+    });
+
+    const request = {
+      callId: 'auto-edit-1',
+      name: 'mockModifiableTool',
+      args: { param: 'value' },
+      isClientInitiated: false,
+      prompt_id: 'prompt-auto-edit-1',
+    };
+
+    const abortController = new AbortController();
+    await scheduler.schedule([request], abortController.signal);
+
+    await vi.waitFor(() => {
+      expect(onAllToolCallsComplete).toHaveBeenCalled();
+    });
+
+    // openDiff should NOT have been called since AUTO_EDIT auto-approves
+    expect(mockIdeClient.openDiff).not.toHaveBeenCalled();
+
+    const completedCalls = onAllToolCallsComplete.mock
+      .calls[0][0] as ToolCall[];
+    expect(completedCalls[0].status).toBe('success');
+  });
+
+  it('should execute normally when IDE accepts without modifying content', async () => {
+    const { mockConfig, mockModifiableTool } = createIdeMockConfig({
+      ideMode: true,
+    });
+
+    // IDE returns accepted without content (no modifications)
+    mockIdeClient.openDiff.mockResolvedValue({
+      status: 'accepted',
+      content: undefined,
+    });
+
+    const onAllToolCallsComplete = vi.fn();
+    const onToolCallsUpdate = vi.fn();
+
+    const scheduler = new CoreToolScheduler({
+      config: mockConfig,
+      onAllToolCallsComplete,
+      onToolCallsUpdate,
+      getPreferredEditor: () => 'vscode',
+      onEditorClose: vi.fn(),
+    });
+
+    const request = {
+      callId: 'ide-no-mod-1',
+      name: 'mockModifiableTool',
+      args: { param: 'keep-this' },
+      isClientInitiated: false,
+      prompt_id: 'prompt-ide-no-mod-1',
+    };
+
+    const abortController = new AbortController();
+    await scheduler.schedule([request], abortController.signal);
+
+    await vi.waitFor(() => {
+      expect(onAllToolCallsComplete).toHaveBeenCalled();
+    });
+
+    const completedCalls = onAllToolCallsComplete.mock
+      .calls[0][0] as ToolCall[];
+    expect(completedCalls[0].status).toBe('success');
+
+    // Tool should execute with original params (no _applyInlineModify call)
+    // executeFn receives the params object from the invocation
+    expect(mockModifiableTool.executeFn).toHaveBeenCalled();
+  });
+
+  it('should cancel tool when IDE rejects the diff', async () => {
+    const { mockConfig } = createIdeMockConfig({
+      ideMode: true,
+    });
+
+    // IDE rejects the diff
+    mockIdeClient.openDiff.mockResolvedValue({
+      status: 'rejected',
+    });
+
+    const onAllToolCallsComplete = vi.fn();
+    const onToolCallsUpdate = vi.fn();
+
+    const scheduler = new CoreToolScheduler({
+      config: mockConfig,
+      onAllToolCallsComplete,
+      onToolCallsUpdate,
+      getPreferredEditor: () => 'vscode',
+      onEditorClose: vi.fn(),
+    });
+
+    const request = {
+      callId: 'ide-reject-1',
+      name: 'mockModifiableTool',
+      args: { param: 'value' },
+      isClientInitiated: false,
+      prompt_id: 'prompt-ide-reject-1',
+    };
+
+    const abortController = new AbortController();
+    await scheduler.schedule([request], abortController.signal);
+
+    await vi.waitFor(() => {
+      expect(onAllToolCallsComplete).toHaveBeenCalled();
+    });
+
+    const completedCalls = onAllToolCallsComplete.mock
+      .calls[0][0] as ToolCall[];
+    expect(completedCalls[0].status).toBe('cancelled');
+  });
+
+  it('should fall back to CLI confirmation when opening the IDE diff fails', async () => {
+    const { mockConfig } = createIdeMockConfig({
+      ideMode: true,
+    });
+
+    mockIdeClient.openDiff.mockRejectedValue(new Error('IDE disconnected'));
+
+    const onAllToolCallsComplete = vi.fn();
+    const onToolCallsUpdate = vi.fn();
+
+    const scheduler = new CoreToolScheduler({
+      config: mockConfig,
+      onAllToolCallsComplete,
+      onToolCallsUpdate,
+      getPreferredEditor: () => 'vscode',
+      onEditorClose: vi.fn(),
+    });
+
+    const request = {
+      callId: 'ide-open-fail-1',
+      name: 'mockModifiableTool',
+      args: { param: 'value' },
+      isClientInitiated: false,
+      prompt_id: 'prompt-ide-open-fail-1',
+    };
+
+    const abortController = new AbortController();
+    await scheduler.schedule([request], abortController.signal);
+
+    const awaitingCall = (await waitForStatus(
+      onToolCallsUpdate,
+      'awaiting_approval',
+    )) as WaitingToolCall;
+
+    expect(awaitingCall.status).toBe('awaiting_approval');
+    expect(mockIdeClient.openDiff).toHaveBeenCalled();
+    expect(onAllToolCallsComplete).not.toHaveBeenCalled();
+  });
+
+  it('should not swallow confirmation handling errors after IDE diff opens', async () => {
+    const { mockConfig } = createIdeMockConfig({
+      ideMode: true,
+    });
+
+    mockIdeClient.openDiff.mockResolvedValue({
+      status: 'rejected',
+    });
+
+    const scheduler = new CoreToolScheduler({
+      config: mockConfig,
+      onAllToolCallsComplete: vi.fn(),
+      onToolCallsUpdate: vi.fn(),
+      getPreferredEditor: () => 'vscode',
+      onEditorClose: vi.fn(),
+    });
+
+    const request = {
+      callId: 'ide-confirmation-error-1',
+      name: 'mockModifiableTool',
+      args: { param: 'value' },
+      isClientInitiated: false,
+      prompt_id: 'prompt-ide-confirmation-error-1',
+    };
+    const confirmationDetails = {
+      type: 'edit',
+      title: 'Confirm Mock Tool',
+      fileName: 'test.txt',
+      filePath: 'test.txt',
+      fileDiff: 'diff',
+      originalContent: 'originalContent',
+      newContent: 'newContent',
+      onConfirm: vi.fn(),
+    } satisfies ToolCallConfirmationDetails;
+    const confirmationError = new Error('confirmation handling failed');
+
+    (
+      scheduler as unknown as {
+        toolCalls: WaitingToolCall[];
+      }
+    ).toolCalls = [
+      {
+        status: 'awaiting_approval',
+        request,
+        tool: {} as never,
+        invocation: {} as never,
+        confirmationDetails,
+      },
+    ];
+
+    vi.spyOn(scheduler, 'handleConfirmationResponse').mockRejectedValue(
+      confirmationError,
+    );
+
+    await expect(
+      (
+        scheduler as unknown as {
+          openIdeDiffIfEnabled: (
+            confirmationDetails: ToolCallConfirmationDetails,
+            callId: string,
+            signal: AbortSignal,
+          ) => Promise<void>;
+        }
+      ).openIdeDiffIfEnabled(
+        confirmationDetails,
+        request.callId,
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow('confirmation handling failed');
+  });
+
+  it('should not call openDiff when IDE mode is disabled', async () => {
+    const { mockConfig } = createIdeMockConfig({
+      ideMode: false,
+    });
+
+    const onAllToolCallsComplete = vi.fn();
+    const onToolCallsUpdate = vi.fn();
+
+    const scheduler = new CoreToolScheduler({
+      config: mockConfig,
+      onAllToolCallsComplete,
+      onToolCallsUpdate,
+      getPreferredEditor: () => 'vscode',
+      onEditorClose: vi.fn(),
+    });
+
+    const request = {
+      callId: 'no-ide-1',
+      name: 'mockModifiableTool',
+      args: { param: 'value' },
+      isClientInitiated: false,
+      prompt_id: 'prompt-no-ide-1',
+    };
+
+    const abortController = new AbortController();
+    await scheduler.schedule([request], abortController.signal);
+
+    // Tool should be awaiting approval but openDiff was never called
+    await waitForStatus(onToolCallsUpdate, 'awaiting_approval');
+    expect(mockIdeClient.openDiff).not.toHaveBeenCalled();
   });
 });

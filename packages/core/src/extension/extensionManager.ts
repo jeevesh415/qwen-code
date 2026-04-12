@@ -30,6 +30,7 @@ import {
   INSTALL_METADATA_FILENAME,
   recursivelyHydrateStrings,
   substituteHookVariables,
+  performVariableReplacement,
 } from './variables.js';
 import { resolveEnvVarsInObject } from '../utils/envVarResolver.js';
 import {
@@ -38,6 +39,7 @@ import {
   downloadFromGitHubRelease,
   parseGitHubRepoForReleases,
 } from './github.js';
+import { downloadFromNpmRegistry } from './npm.js';
 import type { LoadExtensionContext } from './variableSchema.js';
 import { Override, type AllExtensionsEnablementConfig } from './override.js';
 import {
@@ -86,6 +88,15 @@ export enum SettingScope {
   SystemDefaults = 'SystemDefaults',
 }
 
+export interface ExtensionChannelConfig {
+  /** Relative path to JS entry point (must export `plugin: ChannelPlugin`) */
+  entry: string;
+  /** Human-readable name for CLI output */
+  displayName?: string;
+  /** Extra config fields required beyond the shared ChannelConfig fields */
+  requiredConfigFields?: string[];
+}
+
 export interface Extension {
   id: string;
   name: string;
@@ -103,6 +114,7 @@ export interface Extension {
   skills?: SkillConfig[];
   agents?: SubagentConfig[];
   hooks?: { [K in HookEventName]?: HookDefinition[] };
+  channels?: Record<string, ExtensionChannelConfig>;
 }
 
 export interface ExtensionConfig {
@@ -116,6 +128,7 @@ export interface ExtensionConfig {
   agents?: string | string[];
   settings?: ExtensionSetting[];
   hooks?: { [K in HookEventName]?: HookDefinition[] };
+  channels?: Record<string, ExtensionChannelConfig>;
 }
 
 export interface ExtensionUpdateInfo {
@@ -649,6 +662,10 @@ export class ExtensionManager {
         );
       }
 
+      if (config.channels) {
+        extension.channels = config.channels;
+      }
+
       extension.commands = await loadCommandsFromDir(
         `${effectiveExtensionPath}/commands`,
       );
@@ -666,7 +683,7 @@ export class ExtensionManager {
         `${effectiveExtensionPath}/agents`,
       );
 
-      if (config.hooks) {
+      if (config.hooks && typeof config.hooks !== 'string') {
         // Process the hooks to substitute variables like ${CLAUDE_PLUGIN_ROOT}
         extension.hooks = this.substituteHookVariables(
           config.hooks,
@@ -674,17 +691,31 @@ export class ExtensionManager {
         );
       }
 
-      // Also load hooks from hooks directory if available and not already set
+      // Also load hooks from hooks directory or from config.hooks string path if available and not already set
       if (!extension.hooks) {
         const hooksDir = path.join(effectiveExtensionPath, 'hooks');
         const hooksJsonPath = path.join(hooksDir, 'hooks.json');
 
-        if (fs.existsSync(hooksJsonPath)) {
+        const configHooksPath =
+          typeof config.hooks === 'string'
+            ? path.isAbsolute(config.hooks)
+              ? config.hooks
+              : path.join(effectiveExtensionPath, config.hooks)
+            : null;
+
+        if (
+          fs.existsSync(hooksJsonPath) ||
+          (configHooksPath && fs.existsSync(configHooksPath))
+        ) {
+          const hooksFilePath =
+            configHooksPath && fs.existsSync(configHooksPath)
+              ? configHooksPath
+              : hooksJsonPath;
+
           try {
-            const hooksContent = fs.readFileSync(hooksJsonPath, 'utf-8');
+            const hooksContent = fs.readFileSync(hooksFilePath, 'utf-8');
             const parsedHooks = JSON.parse(hooksContent);
 
-            // Check if the file has a top-level "hooks" property or if the entire file content is the hooks object
             let hooksData;
             if (parsedHooks.hooks && typeof parsedHooks.hooks === 'object') {
               hooksData = parsedHooks.hooks as {
@@ -858,6 +889,11 @@ export class ExtensionManager {
           }
         }
         localSourcePath = tempDir;
+      } else if (installMetadata.type === 'npm') {
+        tempDir = await ExtensionStorage.createTmpDir();
+        const result = await downloadFromNpmRegistry(installMetadata, tempDir);
+        installMetadata.releaseTag = result.version;
+        localSourcePath = tempDir;
       } else if (
         installMetadata.type === 'local' ||
         installMetadata.type === 'link'
@@ -987,6 +1023,28 @@ export class ExtensionManager {
           await copyExtension(localSourcePath, destinationPath);
         }
 
+        // Perform variable replacement in extension files (e.g., ${CLAUDE_PLUGIN_ROOT}) for Claude extensions
+        const hooksDir = path.join(destinationPath, 'hooks');
+        const configHooksPath =
+          typeof newExtensionConfig.hooks === 'string'
+            ? path.isAbsolute(newExtensionConfig.hooks)
+              ? newExtensionConfig.hooks
+              : path.join(destinationPath, newExtensionConfig.hooks)
+            : null;
+
+        if (
+          (originSource === 'Claude' && fs.existsSync(hooksDir)) ||
+          (originSource === 'Claude' &&
+            configHooksPath &&
+            fs.existsSync(configHooksPath))
+        ) {
+          try {
+            await performVariableReplacement(destinationPath);
+          } catch (error) {
+            debugLogger.error('Variable replacement failed', error);
+          }
+        }
+
         const metadataString = JSON.stringify(installMetadata, null, 2);
         const metadataPath = path.join(
           destinationPath,
@@ -1015,7 +1073,7 @@ export class ExtensionManager {
               'success',
             ),
           );
-          this.refreshTools();
+          await this.refreshTools();
         } else {
           logExtensionInstallEvent(
             telemetryConfig,
@@ -1128,7 +1186,7 @@ export class ExtensionManager {
     if (isUpdate) return;
 
     this.removeEnablementConfig(extension.name);
-    this.refreshTools();
+    await this.refreshTools();
 
     logExtensionUninstall(
       telemetryConfig,
@@ -1174,9 +1232,9 @@ export class ExtensionManager {
       }
       callback(extension.name, ExtensionUpdateState.CHECKING_FOR_UPDATES);
       promises.push(
-        checkForExtensionUpdate(extension, this).then((state) =>
-          callback(extension.name, state),
-        ),
+        checkForExtensionUpdate(extension, this)
+          .then((state) => callback(extension.name, state))
+          .catch(() => callback(extension.name, ExtensionUpdateState.ERROR)),
       );
     }
     await Promise.all(promises);
@@ -1279,7 +1337,7 @@ export class ExtensionManager {
   async refreshMemory(): Promise<void> {
     if (!this.config) return;
     // refresh mcp servers
-    this.config.getToolRegistry().restartMcpServers();
+    await this.config.getToolRegistry().restartMcpServers();
     // refresh skills
     this.config.getSkillManager()?.refreshCache();
     // refresh subagents
@@ -1291,7 +1349,7 @@ export class ExtensionManager {
   async refreshTools(): Promise<void> {
     if (!this.config) return;
     // FIXME: restart all mcp servers now, this can be optimized by only restarting changed ones at here
-    this.refreshMemory();
+    await this.refreshMemory();
   }
 }
 
@@ -1321,12 +1379,18 @@ export function getExtensionId(
   installMetadata?: ExtensionInstallMetadata,
 ): string {
   let idValue = config.name;
-  const githubUrlParts =
+  let githubUrlParts = null;
+  if (
     installMetadata &&
     (installMetadata.type === 'git' ||
       installMetadata.type === 'github-release')
-      ? parseGitHubRepoForReleases(installMetadata.source)
-      : null;
+  ) {
+    try {
+      githubUrlParts = parseGitHubRepoForReleases(installMetadata.source);
+    } catch {
+      // Non-GitHub URL (GitLab, Bitbucket, etc.) - use source as-is
+    }
+  }
   if (githubUrlParts) {
     idValue = `https://github.com/${githubUrlParts.owner}/${githubUrlParts.repo}`;
   } else {
