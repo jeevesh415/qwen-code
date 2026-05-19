@@ -11,6 +11,8 @@ import {
   useEffect,
   useRef,
   useLayoutEffect,
+  type Dispatch,
+  type SetStateAction,
 } from 'react';
 import { type DOMElement, measureElement } from 'ink';
 import { App } from './App.js';
@@ -23,9 +25,11 @@ import {
 import { ConfigContext } from './contexts/ConfigContext.js';
 import {
   type HistoryItem,
+  type HistoryItemUser,
   ToolCallStatus,
   type HistoryItemWithoutId,
 } from './types.js';
+import type { RestoreOption } from './components/RewindSelector.js';
 import { MessageType, StreamingState } from './types.js';
 import {
   type EditorType,
@@ -40,7 +44,6 @@ import {
   ShellExecutionService,
   Storage,
   SessionEndReason,
-  SessionStartSource,
   generatePromptSuggestion,
   logPromptSuggestion,
   PromptSuggestionEvent,
@@ -52,12 +55,51 @@ import {
   type SpeculationState,
   IDLE_SPECULATION,
   ApprovalMode,
-  type PermissionMode,
+  ConditionalRulesRegistry,
+  MCPDiscoveryState,
+  ToolConfirmationOutcome,
+  type WaitingToolCall,
+  ToolNames,
+  clearWorktreeSession,
+  restoreWorktreeContext,
+  GitWorktreeService,
+  readWorktreeSessionMarker,
 } from '@qwen-code/qwen-code-core';
 import { buildResumedHistoryItems } from './utils/resumeHistoryUtils.js';
-import { validateAuthMethod } from '../config/auth.js';
+import { loadLowlight } from './utils/lowlightLoader.js';
+import { restoreGoalFromHistory } from './utils/restoreGoal.js';
+import {
+  getStickyTodos,
+  getStickyTodoMaxVisibleItems,
+  getStickyTodosLayoutKey,
+  getStickyTodosRenderKey,
+} from './utils/todoSnapshot.js';
+import type { TodoItem } from './components/TodoDisplay.js';
 import { loadHierarchicalGeminiMemory } from '../config/config.js';
+import {
+  profileCheckpoint,
+  finalizeStartupProfile,
+} from '../utils/startupProfiler.js';
+import { appEvents } from '../utils/events.js';
 import process from 'node:process';
+
+/**
+ * Window in which mcp-client-update events are coalesced before the cli calls
+ * `setTools()`. Matches Claude Code's `MCP_BATCH_FLUSH_MS` (16 ≈ one 60Hz
+ * frame). Smaller windows would refresh the model tool list more often
+ * without user benefit; larger windows would let multiple servers settle
+ * before the model sees them. 16ms is the sweet spot validated by Claude's
+ * production deployment (see design.md § 8.3 + § 3.2 Round 2).
+ */
+const MCP_BATCH_FLUSH_MS = 16;
+
+/**
+ * Maximum time we keep the startup profile open waiting for MCP discovery to
+ * settle. Slightly longer than the default 30s per-server discovery timeout
+ * so a server that times out can still log its `outcome: failed` event into
+ * the profile. After this cap the profile file is written regardless.
+ */
+const STARTUP_PROFILE_FINALIZE_CAP_MS = 35_000;
 import { useHistory } from './hooks/useHistoryManager.js';
 import { useMemoryMonitor } from './hooks/useMemoryMonitor.js';
 import { useThemeCommand } from './hooks/useThemeCommand.js';
@@ -66,10 +108,18 @@ import { useAuthCommand } from './auth/useAuth.js';
 import { useEditorSettings } from './hooks/useEditorSettings.js';
 import { useSettingsCommand } from './hooks/useSettingsCommand.js';
 import { useModelCommand } from './hooks/useModelCommand.js';
+import { useManageModelsCommand } from './hooks/useManageModelsCommand.js';
 import { useArenaCommand } from './hooks/useArenaCommand.js';
 import { useApprovalModeCommand } from './hooks/useApprovalModeCommand.js';
+import { useBranchCommand } from './hooks/useBranchCommand.js';
 import { useResumeCommand } from './hooks/useResumeCommand.js';
+import { useDeleteCommand } from './hooks/useDeleteCommand.js';
 import { useSlashCommandProcessor } from './hooks/slashCommandProcessor.js';
+import { useDoublePress } from './hooks/useDoublePress.js';
+import {
+  computeApiTruncationIndex,
+  isRealUserTurn,
+} from './utils/historyMapping.js';
 import { useVimMode } from './contexts/VimModeContext.js';
 import { CompactModeProvider } from './contexts/CompactModeContext.js';
 import { useTerminalSize } from './hooks/useTerminalSize.js';
@@ -82,16 +132,22 @@ import { computeWindowTitle } from '../utils/windowTitle.js';
 import { clearScreen } from '../utils/stdioHelpers.js';
 import { useTextBuffer } from './components/shared/text-buffer.js';
 import { useLogger } from './hooks/useLogger.js';
-import { useGeminiStream } from './hooks/useGeminiStream.js';
+import {
+  useGeminiStream,
+  type CancelSubmitInfo,
+} from './hooks/useGeminiStream.js';
+import type { TrackedExecutingToolCall } from './hooks/useReactToolScheduler.js';
 import { useVim } from './hooks/vim.js';
-import { isBtwCommand } from './utils/commandUtils.js';
+import { isBtwCommand, isSlashCommand } from './utils/commandUtils.js';
 import { type LoadedSettings, SettingScope } from '../config/settings.js';
 import { type InitializationResult } from '../core/initializer.js';
 import { useFocus } from './hooks/useFocus.js';
+import { useAwaySummary } from './hooks/useAwaySummary.js';
 import { useBracketedPaste } from './hooks/useBracketedPaste.js';
 import { useKeypress, type Key } from './hooks/useKeypress.js';
 import { keyMatchers, Command } from './keyMatchers.js';
 import { useLoadingIndicator } from './hooks/useLoadingIndicator.js';
+import { useTerminalProgress } from './hooks/useTerminalProgress.js';
 import { useFolderTrust } from './hooks/useFolderTrust.js';
 import { useIdeTrustListener } from './hooks/useIdeTrustListener.js';
 import { type IdeIntegrationNudgeResult } from './IdeIntegrationNudge.js';
@@ -105,15 +161,26 @@ import { useMessageQueue } from './hooks/useMessageQueue.js';
 import { useAutoAcceptIndicator } from './hooks/useAutoAcceptIndicator.js';
 import { useSessionStats } from './contexts/SessionContext.js';
 import { useGitBranchName } from './hooks/useGitBranchName.js';
+import { useWorktreeSession } from './hooks/useWorktreeSession.js';
+import type { StatusLinePresetConfig } from './statusLinePresets.js';
 import {
   useExtensionUpdates,
   useConfirmUpdateRequests,
   useSettingInputRequests,
   usePluginChoiceRequests,
 } from './hooks/useExtensionUpdates.js';
-import { useCodingPlanUpdates } from './hooks/useCodingPlanUpdates.js';
+import { useProviderUpdates } from './hooks/useProviderUpdates.js';
 import { ShellFocusContext } from './contexts/ShellFocusContext.js';
+import {
+  RenderModeProvider,
+  type RenderMode,
+} from './contexts/RenderModeContext.js';
+import { TerminalOutputProvider } from './contexts/TerminalOutputContext.js';
 import { useAgentViewState } from './contexts/AgentViewContext.js';
+import {
+  useBackgroundTaskViewState,
+  useBackgroundTaskViewActions,
+} from './contexts/BackgroundTaskViewContext.js';
 import { t } from '../i18n/index.js';
 import { useWelcomeBack } from './hooks/useWelcomeBack.js';
 import { useDialogClose } from './hooks/useDialogClose.js';
@@ -123,16 +190,49 @@ import { useAgentsManagerDialog } from './hooks/useAgentsManagerDialog.js';
 import { useExtensionsManagerDialog } from './hooks/useExtensionsManagerDialog.js';
 import { useMcpDialog } from './hooks/useMcpDialog.js';
 import { useHooksDialog } from './hooks/useHooksDialog.js';
+import { useMemoryDialog } from './hooks/useMemoryDialog.js';
 import { useAttentionNotifications } from './hooks/useAttentionNotifications.js';
+import { buildTerminalNotification } from './hooks/useTerminalNotification.js';
 import { useContextualTips } from './hooks/useContextualTips.js';
 import { getTipHistory } from '../services/tips/index.js';
+import { useRemoteInput } from '../remoteInput/RemoteInputContext.js';
+import { useDualOutput } from '../dualOutput/DualOutputContext.js';
 import {
   requestConsentInteractive,
   requestConsentOrFail,
 } from '../commands/extensions/consent.js';
+import { compactToggleHasVisualEffect } from './utils/mergeCompactToolGroups.js';
+import {
+  findLastUserItemIndex,
+  isSyntheticHistoryItem,
+  itemsAfterAreOnlySynthetic,
+} from './utils/historyUtils.js';
 
 const CTRL_EXIT_PROMPT_DURATION_MS = 1000;
 const debugLogger = createDebugLogger('APP_CONTAINER');
+
+export function isRenderModeToggleKey(key: Key): boolean {
+  return (
+    keyMatchers[Command.TOGGLE_RENDER_MODE](key) ||
+    (key.name === 'm' && key.meta && !key.ctrl && !key.paste)
+  );
+}
+
+export function getNextRenderMode(current: RenderMode): RenderMode {
+  return current === 'render' ? 'raw' : 'render';
+}
+
+export function handleRenderModeToggleKey(
+  key: Key,
+  setRenderMode: Dispatch<SetStateAction<RenderMode>>,
+): boolean {
+  if (!isRenderModeToggleKey(key)) {
+    return false;
+  }
+
+  setRenderMode(getNextRenderMode);
+  return true;
+}
 
 function isToolExecuting(pendingHistoryItems: HistoryItemWithoutId[]) {
   return pendingHistoryItems.some((item) => {
@@ -143,6 +243,34 @@ function isToolExecuting(pendingHistoryItems: HistoryItemWithoutId[]) {
     }
     return false;
   });
+}
+
+function useStableStickyTodos(todos: TodoItem[] | null): TodoItem[] | null {
+  const renderKey = getStickyTodosRenderKey(todos);
+  const stableTodosRef = useRef<{
+    renderKey: string;
+    todos: TodoItem[] | null;
+  } | null>(null);
+
+  if (stableTodosRef.current?.renderKey !== renderKey) {
+    stableTodosRef.current = { renderKey, todos };
+  }
+
+  return stableTodosRef.current.todos;
+}
+
+// Exported for tests. Given a newest-first list of messages, return a list
+// with duplicates removed, keeping the first (newest) occurrence of each.
+export function dedupeNewestFirst(messages: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const msg of messages) {
+    if (!seen.has(msg)) {
+      seen.add(msg);
+      result.push(msg);
+    }
+  }
+  return result;
 }
 
 interface AppContainerProps {
@@ -168,6 +296,12 @@ const SHELL_HEIGHT_PADDING = 10;
 export const AppContainer = (props: AppContainerProps) => {
   const { settings, config, initializationResult } = props;
   const historyManager = useHistory();
+  // `useHistory()` returns a fresh memoized object whenever `history` changes,
+  // so depending on `historyManager` directly inside event-handler callbacks
+  // would rebuild them on every message. Mirror history into a ref so
+  // handlers can read the latest snapshot at call time without reactive deps.
+  const historyRef = useRef(historyManager.history);
+  historyRef.current = historyManager.history;
   useMemoryMonitor(historyManager);
   const [debugMessage, setDebugMessage] = useState<string>('');
   const [quittingMessages, setQuittingMessages] = useState<
@@ -254,8 +388,11 @@ export const AppContainer = (props: AppContainerProps) => {
     config.getWorkingDir(),
   );
 
-  const { codingPlanUpdateRequest, dismissCodingPlanUpdate } =
-    useCodingPlanUpdates(settings, config, historyManager.addItem);
+  const { providerUpdateRequest, dismissProviderUpdate } = useProviderUpdates(
+    settings,
+    config,
+    historyManager.addItem,
+  );
 
   const [isTrustDialogOpen, setTrustDialogOpen] = useState(false);
   const openTrustDialog = useCallback(() => setTrustDialogOpen(true), []);
@@ -271,10 +408,7 @@ export const AppContainer = (props: AppContainerProps) => {
     [],
   );
 
-  // Helper to determine the current model (polled, since Config has no model-change event).
-  const getCurrentModel = useCallback(() => config.getModel(), [config]);
-
-  const [currentModel, setCurrentModel] = useState(getCurrentModel());
+  const [currentModel, setCurrentModel] = useState(() => config.getModel());
 
   const [isConfigInitialized, setConfigInitialized] = useState(false);
 
@@ -285,10 +419,52 @@ export const AppContainer = (props: AppContainerProps) => {
   const { stdin, setRawMode } = useStdin();
   const { stdout } = useStdout();
 
+  // Raw write function for terminal escape sequences.
+  // Uses process.stdout directly instead of Ink's useStdout() because
+  // standard Ink v6.2.3 proxies stdout writes through its rendering
+  // pipeline, which can corrupt binary escape sequences (OSC, DCS).
+  const writeRaw = useCallback((data: string) => {
+    process.stdout.write(data);
+  }, []);
+
+  // Terminal notification helpers (constructed directly, not via context)
+  const terminal = useMemo(
+    () => buildTerminalNotification(writeRaw),
+    [writeRaw],
+  );
+
   // Additional hooks moved from App.tsx
   const { stats: sessionStats, startNewSession } = useSessionStats();
   const logger = useLogger(config.storage, sessionStats.sessionId);
   const branchName = useGitBranchName(config.getTargetDir());
+  const worktreeSession = useWorktreeSession(config);
+  const [showWorktreeExitDialog, setShowWorktreeExitDialog] = useState(false);
+  /**
+   * One-shot worktree restore reminder for the TUI path. Set during
+   * `--resume` when the persisted sidecar names a live worktree, then
+   * consumed and cleared by `handleFinalSubmit` on the user's first
+   * prompt — same shape as ACP `Session.pendingWorktreeNotice` and
+   * headless's `<system-reminder>` prefix. Without this, the resumed
+   * model would see an INFO history item in the TUI but never receive
+   * the reminder in the next API request, leaving it free to edit the
+   * parent checkout. (PR #4174 review #3259975249.)
+   */
+  const pendingWorktreeNoticeRef = useRef<string | null>(null);
+  const activeWorktree = useMemo(
+    () =>
+      worktreeSession
+        ? {
+            slug: worktreeSession.slug,
+            branch: worktreeSession.worktreeBranch,
+            path: worktreeSession.worktreePath,
+            originalCwd: worktreeSession.originalCwd,
+            originalBranch: worktreeSession.originalBranch,
+            originalHeadCommit: worktreeSession.originalHeadCommit,
+          }
+        : null,
+    [worktreeSession],
+  );
+
   // Layout measurements
   const mainControlsRef = useRef<DOMElement>(null);
   const originalTitleRef = useRef(
@@ -297,13 +473,51 @@ export const AppContainer = (props: AppContainerProps) => {
   const lastTitleRef = useRef<string | null>(null);
   const staticExtraHeight = 3;
 
+  // Prefetch the lowlight chunk on mount so the dynamic import is already
+  // in flight before the first code block needs colorizing. Without this
+  // kick-off, code blocks committed to ink's append-only <Static> region
+  // before the import resolves stay plain text for the rest of the session
+  // — Static can only be re-rendered via `refreshStatic`, which is not
+  // wired to lowlight load completion. Common reachable paths: short
+  // `--prompt -p` runs that finalize quickly, Ctrl+C-cancelled first turns,
+  // and the first-paint history replay on `--resume`. Firing the load
+  // from mount keeps the startup parse-cost win (V8 still parses off the
+  // critical path) while restoring the "first paint sees a loaded
+  // instance" guarantee. Errors are silently swallowed; CodeColorizer
+  // already falls back to plain text on miss.
+  useEffect(() => {
+    void loadLowlight().catch((err) => {
+      // The loader caches rejection with a cooldown (see
+      // `LOWLIGHT_RETRY_COOLDOWN_MS` / `lowlightLastFailureAt` in
+      // `lowlightLoader.ts`). This useEffect runs once on mount, so this
+      // catch fires at most once per session regardless. Log to the debug
+      // channel so a degraded syntax-highlight state (corrupted install,
+      // missing chunk) leaves a breadcrumb without spamming the user's
+      // TTY — `CodeColorizer` already falls back to plain text.
+      debugLogger.warn(
+        `Failed to load lowlight chunk; code blocks will render as plain text: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }, []);
+
   // Initialize config (runs once on mount)
   useEffect(() => {
     (async () => {
       // Note: the program will not work if this fails so let errors be
       // handled by the global catch.
+      profileCheckpoint('config_initialize_start');
       await config.initialize();
+      profileCheckpoint('config_initialize_end');
       setConfigInitialized(true);
+      profileCheckpoint('input_enabled');
+      // Profile finalize is intentionally NOT here. With PR-A's background
+      // MCP discovery, MCP-related events (`mcp_server_ready:*`,
+      // `mcp_first_tool_registered`, `mcp_all_servers_settled`,
+      // `gemini_tools_updated`) arrive AFTER `input_enabled`. The dedicated
+      // `useEffect` below (gated by `configInitialized`) defers finalize
+      // until MCP discovery settles or the 35s hard cap elapses — that way
+      // the profile captures the full MCP timeline without holding back
+      // the user-facing TTI.
 
       const resumedSessionData = config.getResumedSessionData();
       if (resumedSessionData) {
@@ -312,32 +526,67 @@ export const AppContainer = (props: AppContainerProps) => {
           config,
         );
         historyManager.loadHistory(historyItems);
-      }
 
-      // Fire SessionStart event after config is initialized
-      const sessionStartSource = resumedSessionData
-        ? SessionStartSource.Resume
-        : SessionStartSource.Startup;
+        // Re-arm any `/goal` that was active when the prior session ended.
+        try {
+          restoreGoalFromHistory(historyItems, config, historyManager.addItem);
+        } catch {
+          // Restore is best-effort — never block resume on it.
+        }
 
-      const hookSystem = config.getHookSystem();
-
-      if (hookSystem) {
-        hookSystem
-          .fireSessionStartEvent(
-            sessionStartSource,
-            config.getModel() ?? '',
-            String(config.getApprovalMode()) as PermissionMode,
-          )
-          .then(() => {
-            debugLogger.debug('SessionStart event completed successfully');
-          })
-          .catch((err) => {
-            debugLogger.warn(`SessionStart hook failed: ${err}`);
-          });
-      } else {
-        debugLogger.debug(
-          'SessionStart: HookSystem not available, skipping event',
+        const recovered = await config.loadPausedBackgroundAgents(
+          config.getSessionId(),
         );
+        if (recovered.length > 0) {
+          historyManager.addItem(
+            {
+              type: MessageType.INFO,
+              text: config
+                .getBackgroundAgentResumeService()
+                .buildRecoveredBackgroundAgentsNotice(recovered.length),
+            },
+            Date.now(),
+          );
+        }
+
+        // Restore session name tag from custom title
+        const title = config
+          .getSessionService()
+          .getSessionTitle(config.getSessionId());
+        if (title) {
+          setSessionName(title);
+        }
+
+        // Restore worktree context (shared logic — headless and ACP use
+        // the same helper). Stale sidecars get cleaned up; live ones
+        // produce an INFO message the model sees on the next turn.
+        try {
+          const sessionPath = config
+            .getSessionService()
+            .getWorktreeSessionPath(config.getSessionId());
+          const restored = await restoreWorktreeContext(sessionPath, (err) => {
+            // eslint-disable-next-line no-console
+            console.debug('worktree session restore warning:', err);
+          });
+          if (restored.contextMessage) {
+            // UI: show the notice in the transcript so the user knows.
+            historyManager.addItem(
+              { type: MessageType.INFO, text: restored.contextMessage },
+              Date.now(),
+            );
+            // Model: queue the notice for one-shot injection into the
+            // next user prompt (consumed by handleFinalSubmit). The INFO
+            // history item alone is UI-only — the model never sees it,
+            // so without this it could resume editing the parent
+            // checkout despite the user seeing the worktree path.
+            pendingWorktreeNoticeRef.current = restored.contextMessage;
+          }
+        } catch (error) {
+          // Best-effort: failures here only affect UI hint visibility,
+          // not the resumed conversation itself.
+          // eslint-disable-next-line no-console
+          console.debug('worktree session restore failed:', error);
+        }
       }
     })();
 
@@ -360,25 +609,157 @@ export const AppContainer = (props: AppContainerProps) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config]);
 
-  useEffect(
-    () => setUpdateHandler(historyManager.addItem, setUpdateInfo),
-    [historyManager.addItem],
-  );
-
-  // Watch for model changes (e.g., user switches model via /model)
+  /**
+   * PR-A wiring: progressive MCP availability.
+   *
+   * This effect does two coupled things, both gated on `configInitialized`:
+   *
+   * 1. **16ms batch-flush of `setTools()`**: as each MCP server completes
+   *    discover, `McpClientManager` emits `mcp-client-update`. We coalesce
+   *    these into at most one `GeminiClient.setTools()` call per ~16ms
+   *    window. With three MCP servers settling within a few ms of each
+   *    other, the model sees one consolidated tool refresh instead of
+   *    three back-to-back; with a server stream over 1s, the model sees
+   *    each batch with at most one frame of lag (this is the gap the
+   *    baseline measured at 6235 ms in three-mixed-mcp before PR-A).
+   *
+   * 2. **Deferred startup-profile finalize**: in PR-A's default mode
+   *    MCP discovery runs in the background, so MCP-related profiler
+   *    events arrive AFTER `input_enabled`. The profile file is held open
+   *    until either the manager's discovery state reaches `COMPLETED`
+   *    (all servers ready or failed) or `STARTUP_PROFILE_FINALIZE_CAP_MS`
+   *    elapses (so a hung server doesn't keep the profile open forever).
+   *
+   * In legacy blocking mode (`QWEN_CODE_LEGACY_MCP_BLOCKING=1`) MCP
+   * discovery already completed inside `config.initialize()`, so this
+   * effect observes `MCPDiscoveryState.COMPLETED` immediately and finalizes
+   * without waiting.
+   */
   useEffect(() => {
-    const checkModelChange = () => {
-      const model = getCurrentModel();
-      if (model !== currentModel) {
-        setCurrentModel(model);
+    if (!isConfigInitialized) return undefined;
+    const geminiClient = config.getGeminiClient();
+    if (!geminiClient) return undefined;
+
+    const manager = config.getToolRegistry().getMcpClientManager();
+    let flushTimer: NodeJS.Timeout | null = null;
+    let finalized = false;
+
+    const finalizeOnce = () => {
+      if (finalized) return;
+      finalized = true;
+      finalizeStartupProfile(config.getSessionId());
+    };
+
+    // Runs the pending batched setTools() immediately and clears the timer.
+    // Returns a promise that resolves when setTools() finishes so callers
+    // can sequence subsequent work after `gemini_tools_updated` is
+    // recorded into the startup profile.
+    const flushNow = (): Promise<void> => {
+      if (flushTimer !== null) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      // GeminiClient.setTools() has no try/catch around warmAll() /
+      // getFunctionDeclarations() / getChat().setTools(). A silent
+      // discard here would make production tool-registration regressions
+      // invisible, so route the error through debugLogger.
+      return geminiClient.setTools().catch((err) => {
+        debugLogger.error(
+          `setTools() batch-flush failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    };
+
+    const scheduleFlush = () => {
+      if (flushTimer !== null) return;
+      flushTimer = setTimeout(() => {
+        flushTimer = null;
+        void flushNow();
+      }, MCP_BATCH_FLUSH_MS);
+    };
+
+    // Match the non-interactive entry points (`gemini.tsx`, `session.ts`,
+    // `acpAgent.ts`) which warn to stderr when MCP discovery completes with
+    // failed servers. The interactive path can't use stderr (it would
+    // collide with Ink's rendered output), so we route through
+    // `debugLogger.warn` so it shows up under `QWEN_CODE_DEBUG=1` and in
+    // the debug log file — matching the channel `setTools()` errors above
+    // use. The MCP status footer pill already surfaces failures
+    // continuously in the UI; this log is the actionable-on-debug record
+    // wenshao asked for in round 7.
+    let failureSurfaced = false;
+    const surfaceFailuresOnce = () => {
+      if (failureSurfaced) return;
+      failureSurfaced = true;
+      const failedNames =
+        typeof config.getFailedMcpServerNames === 'function'
+          ? config.getFailedMcpServerNames()
+          : [];
+      if (failedNames.length > 0) {
+        debugLogger.warn(
+          `MCP server(s) failed to start: ${failedNames.join(', ')}. ` +
+            `Continuing with built-in tools and any servers that did connect.`,
+        );
       }
     };
 
-    checkModelChange();
-    const interval = setInterval(checkModelChange, 1000); // Check every second
+    const onMcpUpdate = () => {
+      if (manager.getDiscoveryState() === MCPDiscoveryState.COMPLETED) {
+        // Discovery has settled. Flush the pending setTools() NOW (rather
+        // than waiting for the 16ms batch timer) and only finalize after
+        // it runs — `setTools()` emits the `gemini_tools_updated` event,
+        // and finalizing before it fires would drop that event because
+        // the module-level `finalized` guard suppresses every subsequent
+        // record. That dropped event is what `gemini_tools_lag` is
+        // derived from in the profile summary.
+        surfaceFailuresOnce();
+        void flushNow().finally(finalizeOnce);
+      } else {
+        scheduleFlush();
+      }
+    };
 
-    return () => clearInterval(interval);
-  }, [config, currentModel, getCurrentModel]);
+    // Legacy / no-MCP path: discovery already finished synchronously
+    // inside config.initialize(), so finalize immediately and only keep
+    // the flush listener around for late refreshes (e.g. SkillTool's
+    // post-construction refreshSkills triggering setTools).
+    if (manager.getDiscoveryState() === MCPDiscoveryState.COMPLETED) {
+      surfaceFailuresOnce();
+      finalizeOnce();
+    }
+
+    appEvents.on('mcp-client-update', onMcpUpdate);
+    const finalizeCap = setTimeout(
+      finalizeOnce,
+      STARTUP_PROFILE_FINALIZE_CAP_MS,
+    );
+
+    return () => {
+      appEvents.off('mcp-client-update', onMcpUpdate);
+      if (flushTimer !== null) clearTimeout(flushTimer);
+      clearTimeout(finalizeCap);
+    };
+  }, [isConfigInitialized, config]);
+
+  // Track idle state via ref so the update handler can defer notifications
+  // while the model is streaming, without triggering re-renders.
+  // Note: isIdleRef.current is assigned after streamingState becomes available
+  // (see the assignment below useGeminiStream).
+  const isIdleRef = useRef(true);
+  const updateHandlerRef = useRef<{
+    cleanup: () => void;
+    flush: () => void;
+  } | null>(null);
+
+  useEffect(() => {
+    const handler = setUpdateHandler(
+      historyManager.addItem,
+      setUpdateInfo,
+      isIdleRef,
+    );
+    updateHandlerRef.current = handler;
+    return () => handler?.cleanup();
+  }, [historyManager.addItem]);
 
   // Derive widths for InputPrompt using shared helper
   const { inputWidth, suggestionsWidth } = useMemo(() => {
@@ -419,28 +800,79 @@ export const AppContainer = (props: AppContainerProps) => {
         )
         .map((item) => item.text)
         .reverse();
+      // Current-session messages are already newest-first; combining with past
+      // messages gives a newest-first list. dedupeNewestFirst keeps the first
+      // (newest) occurrence so resubmitting an old prompt promotes it to
+      // "most recent" rather than leaving a stale copy at an older position.
       const combinedMessages = [
         ...currentSessionUserMessages,
         ...pastMessagesRaw,
       ];
-      const deduplicatedMessages: string[] = [];
-      if (combinedMessages.length > 0) {
-        deduplicatedMessages.push(combinedMessages[0]);
-        for (let i = 1; i < combinedMessages.length; i++) {
-          if (combinedMessages[i] !== combinedMessages[i - 1]) {
-            deduplicatedMessages.push(combinedMessages[i]);
-          }
-        }
-      }
-      setUserMessages(deduplicatedMessages.reverse());
+      setUserMessages(dedupeNewestFirst(combinedMessages).reverse());
     };
     fetchUserMessages();
   }, [historyManager.history, logger]);
 
+  const remountStaticHistory = useCallback(() => {
+    setHistoryRemountKey((prev) => prev + 1);
+  }, []);
+
   const refreshStatic = useCallback(() => {
     stdout.write(ansiEscapes.clearTerminal);
-    setHistoryRemountKey((prev) => prev + 1);
-  }, [setHistoryRemountKey, stdout]);
+    remountStaticHistory();
+  }, [remountStaticHistory, stdout]);
+
+  // Targeted repaint for resize events: move cursor to top-left and erase
+  // downward instead of a full clearTerminal, avoiding the full-screen
+  // flash. Ink's <Static> region is append-only, so when terminal width
+  // changes (tmux split, fullscreen toggle, font size change) we must
+  // explicitly re-emit the static history at the new width — otherwise
+  // header content stays at the old width and visibly tears.
+  const repaintStaticViewport = useCallback(() => {
+    stdout.write(`${ansiEscapes.cursorTo(0, 0)}${ansiEscapes.eraseDown}`);
+    remountStaticHistory();
+  }, [remountStaticHistory, stdout]);
+
+  // Track previous terminal width across renders so we only repaint when
+  // the width actually changes. Initialized to the current width to avoid
+  // a spurious repaint on first mount.
+  const previousTerminalWidthRef = useRef(terminalWidth);
+
+  // Keep the static header in sync with model changes without polling.
+  // Ink's <Static> output is append-only, so model changes must explicitly
+  // clear and remount the static region to redraw the banner at the top.
+  //
+  // Two requirements pull in opposite directions:
+  //   (a) refreshStatic() must NOT be called from inside a setState updater,
+  //       because React.StrictMode double-invokes updaters in dev and we'd
+  //       fire two clearTerminal writes per model swap.
+  //   (b) setHistoryRemountKey (inside refreshStatic) and setCurrentModel
+  //       MUST land in the SAME commit. MainContent's <Static> key is
+  //       `${historyRemountKey}-${currentModel}` and its render-phase
+  //       progressive-replay reset (lastRemountKey !== historyRemountKey)
+  //       only fires when historyRemountKey changes. If currentModel
+  //       changes first in its own render, Static remounts with the OLD
+  //       remount key and the unreset (full-length) replayCount — i.e.
+  //       a full-history Static render that bypasses progressive replay
+  //       (the issue #3899 freeze regression). See PR #4119 review.
+  //
+  // Fix: side-effect lives in the event handler (NOT the updater); a ref
+  // guard de-dupes same-model notifications. React batches the
+  // setHistoryRemountKey (via refreshStatic) and setCurrentModel calls in
+  // this event handler into a single commit, so the render-phase reset
+  // and the Static remount happen together — no full-history flash.
+  const lastNotifiedModelRef = useRef(currentModel);
+  useEffect(() => {
+    const unsubscribe = config.onModelChange((model) => {
+      if (lastNotifiedModelRef.current === model) {
+        return;
+      }
+      lastNotifiedModelRef.current = model;
+      refreshStatic();
+      setCurrentModel(model);
+    });
+    return unsubscribe;
+  }, [config, refreshStatic]);
 
   const {
     isThemeDialogOpen,
@@ -460,20 +892,15 @@ export const AppContainer = (props: AppContainerProps) => {
     handleApprovalModeSelect,
   } = useApprovalModeCommand(settings, config);
 
-  const {
-    setAuthState,
-    authError,
-    onAuthError,
-    isAuthDialogOpen,
-    isAuthenticating,
-    pendingAuthType,
-    qwenAuthState,
-    handleAuthSelect,
-    handleCodingPlanSubmit,
-    handleAlibabaStandardSubmit,
-    openAuthDialog,
-    cancelAuthentication,
-  } = useAuthCommand(settings, config, historyManager.addItem, refreshStatic);
+  const auth = useAuthCommand(
+    settings,
+    config,
+    historyManager.addItem,
+    refreshStatic,
+  );
+  const { state: authState, actions: authActions } = auth;
+  const { onAuthError, openAuthDialog, handleAuthSelect } = authActions;
+  const { isAuthDialogOpen, isAuthenticating, pendingAuthType } = authState;
 
   useInitializationAuthError(initializationResult.authError, onAuthError);
 
@@ -504,22 +931,8 @@ export const AppContainer = (props: AppContainerProps) => {
           },
         ),
       );
-    } else if (!settings.merged.security?.auth?.useExternal) {
-      // If no authType is selected yet, allow the auth UI flow to prompt the user.
-      // Only validate credentials once a concrete authType exists.
-      if (currentAuthType) {
-        const error = validateAuthMethod(currentAuthType, config);
-        if (error) {
-          onAuthError(error);
-        }
-      }
     }
-  }, [
-    settings.merged.security?.auth?.enforcedType,
-    settings.merged.security?.auth?.useExternal,
-    config,
-    onAuthError,
-  ]);
+  }, [settings.merged.security?.auth?.enforcedType, config, onAuthError]);
 
   const [editorError, setEditorError] = useState<string | null>(null);
   const {
@@ -531,6 +944,28 @@ export const AppContainer = (props: AppContainerProps) => {
 
   const { isSettingsDialogOpen, openSettingsDialog, closeSettingsDialog } =
     useSettingsCommand();
+  const [isStatusLineDialogOpen, setStatusLineDialogOpen] = useState(false);
+  const openStatusLineDialog = useCallback(
+    () => setStatusLineDialogOpen(true),
+    [],
+  );
+  const closeStatusLineDialog = useCallback(
+    () => setStatusLineDialogOpen(false),
+    [],
+  );
+  const [statusLineSettingsVersion, setStatusLineSettingsVersion] = useState(0);
+  const [statusLineConfigOverride, setStatusLineConfigOverride] = useState<
+    StatusLinePresetConfig | undefined
+  >(undefined);
+  const notifyStatusLineSettingsChanged = useCallback(
+    (newConfig: StatusLinePresetConfig) => {
+      setStatusLineConfigOverride(newConfig);
+      setStatusLineSettingsVersion((version) => version + 1);
+    },
+    [],
+  );
+  const { isMemoryDialogOpen, openMemoryDialog, closeMemoryDialog } =
+    useMemoryDialog();
 
   const {
     isModelDialogOpen,
@@ -538,11 +973,20 @@ export const AppContainer = (props: AppContainerProps) => {
     openModelDialog,
     closeModelDialog,
   } = useModelCommand();
+  const {
+    isManageModelsDialogOpen,
+    openManageModelsDialog,
+    closeManageModelsDialog,
+  } = useManageModelsCommand();
   const { activeArenaDialog, openArenaDialog, closeArenaDialog } =
     useArenaCommand();
 
+  // Session name state (set via /rename, restored on /resume)
+  const [sessionName, setSessionName] = useState<string | null>(null);
+
   const {
     isResumeDialogOpen,
+    resumeMatchedSessions,
     openResumeDialog,
     closeResumeDialog,
     handleResume,
@@ -550,8 +994,35 @@ export const AppContainer = (props: AppContainerProps) => {
     config,
     historyManager,
     startNewSession,
+    setSessionName,
     remount: refreshStatic,
   });
+
+  const { handleBranch } = useBranchCommand({
+    config,
+    historyManager,
+    startNewSession,
+    setSessionName,
+    remount: refreshStatic,
+  });
+
+  const {
+    isDeleteDialogOpen,
+    openDeleteDialog,
+    closeDeleteDialog,
+    handleDelete,
+    handleDeleteMany,
+  } = useDeleteCommand({
+    config,
+    addItem: historyManager.addItem,
+  });
+
+  const [isHelpDialogOpen, setHelpDialogOpen] = useState(false);
+  const [activeHelpTab, setHelpTab] = useState<
+    'general' | 'commands' | 'custom-commands'
+  >('general');
+  const openHelpDialog = useCallback(() => setHelpDialogOpen(true), []);
+  const closeHelpDialog = useCallback(() => setHelpDialogOpen(false), []);
 
   const { toggleVimEnabled } = useVimMode();
 
@@ -574,13 +1045,22 @@ export const AppContainer = (props: AppContainerProps) => {
   const { isHooksDialogOpen, openHooksDialog, closeHooksDialog } =
     useHooksDialog();
 
+  // Ref bridge: the guarded openRewindSelector callback is defined later
+  // (after useDoublePress), but slashCommandActions needs it now. The ref
+  // lets the useMemo capture a stable function pointer whose implementation
+  // is swapped in once the real callback exists.
+  const openRewindSelectorRef = useRef<() => void>(() => {});
+
   const slashCommandActions = useMemo(
     () => ({
       openAuthDialog,
       openThemeDialog,
       openEditorDialog,
+      openMemoryDialog,
       openSettingsDialog,
+      openStatusLineDialog,
       openModelDialog,
+      openManageModelsDialog,
       openTrustDialog,
       openArenaDialog,
       openPermissionsDialog,
@@ -601,13 +1081,21 @@ export const AppContainer = (props: AppContainerProps) => {
       openMcpDialog,
       openHooksDialog,
       openResumeDialog,
+      openRewindSelector: () => openRewindSelectorRef.current(),
+      handleResume,
+      handleBranch,
+      openDeleteDialog,
+      openHelpDialog,
     }),
     [
       openAuthDialog,
       openThemeDialog,
       openEditorDialog,
+      openMemoryDialog,
       openSettingsDialog,
+      openStatusLineDialog,
       openModelDialog,
+      openManageModelsDialog,
       openArenaDialog,
       setDebugMessage,
       dispatchExtensionStateUpdate,
@@ -621,12 +1109,17 @@ export const AppContainer = (props: AppContainerProps) => {
       openMcpDialog,
       openHooksDialog,
       openResumeDialog,
+      handleResume,
+      handleBranch,
+      openDeleteDialog,
+      openHelpDialog,
     ],
   );
 
   const {
     handleSlashCommand,
     slashCommands,
+    recentSlashCommands,
     pendingHistoryItems: pendingSlashCommandHistoryItems,
     btwItem,
     setBtwItem,
@@ -640,15 +1133,17 @@ export const AppContainer = (props: AppContainerProps) => {
     historyManager.addItem,
     historyManager.clearItems,
     historyManager.loadHistory,
-    refreshStatic,
+    remountStaticHistory,
     toggleVimEnabled,
     isProcessing,
     setIsProcessing,
+    isIdleRef,
     setGeminiMdFileCount,
     slashCommandActions,
     extensionsUpdateStateInternal,
     isConfigInitialized,
     logger,
+    setSessionName,
   );
 
   // onDebugMessage should log to debug logfile, not update footer debugMessage
@@ -657,6 +1152,107 @@ export const AppContainer = (props: AppContainerProps) => {
       config.getDebugLogger().debug(message);
     },
     [config],
+  );
+
+  const handleWorktreeExit = useCallback(
+    async (choice: 'keep' | 'remove' | 'cancel') => {
+      if (choice === 'cancel') {
+        setShowWorktreeExitDialog(false);
+        return;
+      }
+      setShowWorktreeExitDialog(false);
+      if (choice === 'remove' && activeWorktree) {
+        try {
+          // Anchor at the repo top-level (captured at enter time) rather
+          // than the current targetDir — when the CLI was launched from
+          // a monorepo subdirectory, `config.getTargetDir()` is that
+          // subdir but the worktree lives at `<repoRoot>/.qwen/worktrees/`,
+          // so a service rooted at the subdir would never find it. (PR
+          // #4174 review finding 3252368637.)
+          const svc = new GitWorktreeService(activeWorktree.originalCwd);
+          // Ownership guard — read the in-worktree session marker and
+          // refuse to remove a worktree owned by a different session
+          // (stale sidecar, copied state from another machine, etc.).
+          // Mirrors the guard ExitWorktreeTool applies on the model
+          // path; without it the dialog could destroy a worktree it
+          // doesn't own. (PR #4174 review #3259975247.)
+          const owner = await readWorktreeSessionMarker(activeWorktree.path);
+          const currentSessionId = config.getSessionId();
+          if (owner !== null && owner !== currentSessionId) {
+            historyManager.addItem(
+              {
+                type: MessageType.ERROR,
+                text:
+                  `Refusing to remove worktree "${activeWorktree.slug}" — ` +
+                  `it was created by a different session (owner=${owner}). ` +
+                  `Resume the owning session to drop it, or remove it ` +
+                  `manually with \`git worktree remove ${activeWorktree.path}\`.`,
+              },
+              Date.now(),
+            );
+            return;
+          }
+          // The user just clicked Remove on a dialog that already showed
+          // the dirty-state and unmerged-commit counts ("discards N
+          // commits, M files"). Force-delete the branch to honour that
+          // intent — without it, `git branch -d` refuses unmerged
+          // commits and the branch is silently preserved, contradicting
+          // the dialog text. (Finding 3252368640 part 2.)
+          const result = await svc.removeUserWorktree(activeWorktree.slug, {
+            deleteBranch: true,
+            forceDeleteBranch: true,
+          });
+          // removeUserWorktree returns {success, error} on failure — it
+          // does NOT throw — so the previous try/catch never tripped on
+          // a soft failure. If removal failed, leave the sidecar intact
+          // so the next --resume can still see the worktree. Surface
+          // the error in history and stay in the session so the user
+          // can decide what to do (retry via exit_worktree, fix the
+          // underlying problem, or force-quit). Previously the dialog
+          // silently /quit on failure, contradicting the "discards N
+          // commits, M files" intent the user clicked Remove on.
+          // (Findings 3252368640 part 1 + 3256237933.)
+          if (!result.success) {
+            historyManager.addItem(
+              {
+                type: MessageType.ERROR,
+                text:
+                  `Failed to remove worktree "${activeWorktree.slug}": ` +
+                  `${result.error ?? 'unknown error'}. The worktree is ` +
+                  `still on disk; use \`exit_worktree\` to retry or ` +
+                  `remove it manually with \`git worktree remove\`.`,
+              },
+              Date.now(),
+            );
+            return;
+          }
+          await clearWorktreeSession(
+            config
+              .getSessionService()
+              .getWorktreeSessionPath(config.getSessionId()),
+          );
+        } catch (error) {
+          // Hard failure (e.g. git binary missing, GitWorktreeService
+          // constructor threw). Same treatment as the soft failure
+          // path: surface to the user and stay alive — silent /quit
+          // here would leave the user wondering whether the worktree
+          // was actually removed.
+          historyManager.addItem(
+            {
+              type: MessageType.ERROR,
+              text:
+                `Worktree removal failed for "${activeWorktree.slug}": ` +
+                `${error instanceof Error ? error.message : String(error)}. ` +
+                `Use \`exit_worktree\` or remove it manually.`,
+            },
+            Date.now(),
+          );
+          return;
+        }
+      }
+      handleSlashCommand('/quit');
+    },
+    [activeWorktree, config, handleSlashCommand, historyManager],
   );
 
   const performMemoryRefresh = useCallback(async () => {
@@ -668,19 +1264,24 @@ export const AppContainer = (props: AppContainerProps) => {
       Date.now(),
     );
     try {
-      const { memoryContent, fileCount } = await loadHierarchicalGeminiMemory(
-        process.cwd(),
-        settings.merged.context?.loadFromIncludeDirectories
-          ? config.getWorkspaceContext().getDirectories()
-          : [],
-        config.getFileService(),
-        config.getExtensionContextFilePaths(),
-        config.isTrustedFolder(),
-        settings.merged.context?.importFormat || 'tree', // Use setting or default to 'tree'
-      );
+      const { memoryContent, fileCount, conditionalRules, projectRoot } =
+        await loadHierarchicalGeminiMemory(
+          process.cwd(),
+          settings.merged.context?.loadFromIncludeDirectories
+            ? config.getWorkspaceContext().getDirectories()
+            : [],
+          config.getFileService(),
+          config.getExtensionContextFilePaths(),
+          config.isTrustedFolder(),
+          settings.merged.context?.importFormat || 'tree', // Use setting or default to 'tree'
+          config.getContextRuleExcludes(),
+        );
 
       config.setUserMemory(memoryContent);
       config.setGeminiMdFileCount(fileCount);
+      config.setConditionalRulesRegistry(
+        new ConditionalRulesRegistry(conditionalRules, projectRoot),
+      );
       setGeminiMdFileCount(fileCount);
 
       historyManager.addItem(
@@ -713,7 +1314,7 @@ export const AppContainer = (props: AppContainerProps) => {
     }
   }, [config, historyManager, settings.merged]);
 
-  const cancelHandlerRef = useRef<() => void>(() => {});
+  const cancelHandlerRef = useRef<(info?: CancelSubmitInfo) => void>(() => {});
   const midTurnDrainRef = useRef<(() => string[]) | null>(null);
 
   const {
@@ -727,6 +1328,9 @@ export const AppContainer = (props: AppContainerProps) => {
     handleApprovalModeChange,
     activePtyId,
     loopDetectionConfirmationRequest,
+    pendingToolCalls,
+    streamingResponseLengthRef,
+    isReceivingContent,
   } = useGeminiStream(
     config.getGeminiClient(),
     historyManager.history,
@@ -742,12 +1346,23 @@ export const AppContainer = (props: AppContainerProps) => {
     modelSwitchedFromQuotaError,
     setModelSwitchedFromQuotaError,
     refreshStatic,
-    () => cancelHandlerRef.current(),
+    (info) => cancelHandlerRef.current(info),
     setEmbeddedShellFocused,
     terminalWidth,
     terminalHeight,
     midTurnDrainRef,
+    logger,
   );
+
+  // Now that streamingState is available, keep isIdleRef in sync and
+  // flush any deferred update notifications when the model finishes responding.
+  isIdleRef.current = streamingState === StreamingState.Idle;
+
+  useEffect(() => {
+    if (streamingState === StreamingState.Idle) {
+      updateHandlerRef.current?.flush();
+    }
+  }, [streamingState]);
 
   // Contextual tips — show tips based on context usage after model responses
   // Defer TipHistory loading when tips are disabled to avoid side effects
@@ -769,10 +1384,15 @@ export const AppContainer = (props: AppContainerProps) => {
     hideTips: tipsDisabled,
   });
 
-  // Track whether suggestions are visible for Tab key handling
-  const [hasSuggestionsVisible, setHasSuggestionsVisible] = useState(false);
+  // Track whether the input area has any Tab consumer (autocomplete dropdown,
+  // followup suggestion, mid-input ghost text, reverse/command search). When
+  // true, we suppress the Windows-only "bare Tab cycles approval mode"
+  // fallback so a single Tab keystroke triggers only one action. See #4171.
+  const [hasTabConsumer, setHasTabConsumer] = useState(false);
 
   const agentViewState = useAgentViewState();
+  const { dialogOpen: bgTasksDialogOpen } = useBackgroundTaskViewState();
+  const { closeDialog: closeBgTasksDialog } = useBackgroundTaskViewActions();
 
   // Prompt suggestion state
   const [promptSuggestion, setPromptSuggestion] = useState<string | null>(null);
@@ -794,21 +1414,148 @@ export const AppContainer = (props: AppContainerProps) => {
     config,
     addItem: historyManager.addItem,
     onApprovalModeChange: handleApprovalModeChange,
-    shouldBlockTab: () => hasSuggestionsVisible,
+    shouldBlockTab: () => hasTabConsumer,
     disabled: agentViewState.activeView !== 'main',
   });
 
-  const { messageQueue, addMessage, popAllMessages, drainQueue } =
-    useMessageQueue({
-      isConfigInitialized,
-      streamingState,
-      submitQuery,
-    });
+  const {
+    messageQueue,
+    addMessage,
+    popAllMessages,
+    drainQueue,
+    popNextSegment,
+  } = useMessageQueue();
 
   // Bridge message queue to mid-turn drain via ref.
   // drainQueue reads the synchronous queueRef inside the hook, so it
-  // stays consistent with popAllMessages even before React re-renders.
+  // stays consistent with popNextSegment even before React re-renders.
   midTurnDrainRef.current = drainQueue;
+
+  // Connect remote input watcher to submitQuery for bidirectional sync.
+  // When an external process writes a command to the input-file,
+  // the watcher calls submitQuery as if the user typed it in the TUI.
+  const remoteInput = useRemoteInput();
+  useEffect(() => {
+    if (!remoteInput) return;
+    remoteInput.setSubmitFn((text: string) => submitQuery(text));
+  }, [remoteInput, submitQuery]);
+
+  // Notify remote input watcher when TUI becomes idle so it can
+  // retry queued commands that were deferred while TUI was busy.
+  useEffect(() => {
+    if (!remoteInput) return;
+    if (streamingState === StreamingState.Idle) {
+      remoteInput.notifyIdle();
+    }
+  }, [remoteInput, streamingState]);
+
+  // Dual-output tool-confirmation bridge.
+  //
+  // When a tool call enters awaiting_approval we emit a `control_request`
+  // (subtype: can_use_tool) on the dual-output channel so an external
+  // consumer can decide. Whichever side resolves first (TUI native UI or
+  // `confirmation_response` written to --input-file) wins; we always emit
+  // a `control_response` mirroring the final decision so observers stay in
+  // sync.
+  const dualOutput = useDualOutput();
+  const confirmRequestMap = useRef(new Map<string, string>()); // requestId → callId
+  const confirmCallIdMap = useRef(new Map<string, string>()); // callId → requestId
+  const confirmEmitted = useRef(new Set<string>());
+
+  useEffect(() => {
+    if (!dualOutput || !dualOutput.isConnected) return;
+    for (const tc of pendingToolCalls) {
+      if (
+        tc.status === 'awaiting_approval' &&
+        !confirmEmitted.current.has(tc.request.callId)
+      ) {
+        const requestId = crypto.randomUUID();
+        confirmRequestMap.current.set(requestId, tc.request.callId);
+        confirmCallIdMap.current.set(tc.request.callId, requestId);
+        confirmEmitted.current.add(tc.request.callId);
+        dualOutput.emitPermissionRequest(
+          requestId,
+          tc.request.name,
+          tc.request.callId,
+          tc.request.args,
+        );
+      }
+    }
+    // Detect tools that left awaiting_approval (TUI-native resolution) so we
+    // can emit a matching control_response back to external consumers.
+    for (const [callId, requestId] of confirmCallIdMap.current) {
+      const tc = pendingToolCalls.find((t) => t.request.callId === callId);
+      if (
+        tc &&
+        tc.status !== 'awaiting_approval' &&
+        confirmEmitted.current.has(callId)
+      ) {
+        const allowed = tc.status !== 'cancelled' && tc.status !== 'error';
+        dualOutput.emitControlResponse(requestId, allowed);
+        confirmRequestMap.current.delete(requestId);
+        confirmCallIdMap.current.delete(callId);
+        confirmEmitted.current.delete(callId);
+      }
+    }
+  }, [dualOutput, pendingToolCalls]);
+
+  // Keep latest state in refs so the confirmation handler (registered once)
+  // always reads current values without needing re-registration.
+  const pendingToolCallsRef = useRef(pendingToolCalls);
+  pendingToolCallsRef.current = pendingToolCalls;
+  const dualOutputRef = useRef(dualOutput);
+  dualOutputRef.current = dualOutput;
+
+  // Route confirmation_response commands written to --input-file back into
+  // the tool's onConfirm handler. Registered once (deps: [remoteInput]) to
+  // avoid teardown/re-registration churn on every pendingToolCalls change.
+  useEffect(() => {
+    if (!remoteInput) return;
+    remoteInput.setConfirmationHandler(
+      (requestId: string, allowed: boolean) => {
+        const callId = confirmRequestMap.current.get(requestId);
+        if (!callId) {
+          dualOutputRef.current?.emitControlError(
+            requestId,
+            'unknown request_id (already resolved, cancelled, or never issued)',
+          );
+          return;
+        }
+        const tc = pendingToolCallsRef.current.find(
+          (t) =>
+            t.request.callId === callId && t.status === 'awaiting_approval',
+        );
+        if (!tc) {
+          dualOutputRef.current?.emitControlError(
+            requestId,
+            'tool call is no longer awaiting approval',
+          );
+          return;
+        }
+        const waitingTc = tc as WaitingToolCall;
+        if (!waitingTc.confirmationDetails?.onConfirm) {
+          dualOutputRef.current?.emitControlError(
+            requestId,
+            'tool call has no onConfirm handler',
+          );
+          return;
+        }
+        void waitingTc.confirmationDetails.onConfirm(
+          allowed
+            ? ToolConfirmationOutcome.ProceedOnce
+            : ToolConfirmationOutcome.Cancel,
+        );
+        // Do NOT clean up maps here — let the mirror useEffect (line ~870)
+        // detect the state transition and emit control_response + clean up,
+        // keeping the emission path symmetric for both TUI-native and
+        // external-initiated resolutions.
+      },
+    );
+
+    return () => {
+      remoteInput.setConfirmationHandler(() => {});
+    };
+  }, [remoteInput]);
 
   // Callback for handling final submit (must be after addMessage from useMessageQueue)
   const handleFinalSubmit = useCallback(
@@ -820,6 +1567,18 @@ export const AppContainer = (props: AppContainerProps) => {
           agent.interactiveAgent.enqueueMessage(submittedValue.trim());
           return;
         }
+      }
+      // Phase C: one-shot worktree restore reminder. Set during --resume
+      // when the persisted sidecar names a live worktree. We only inject
+      // on top-level user prompts (not btw-during-response, not slash
+      // commands — those go through different paths). Once consumed,
+      // clear the ref so subsequent prompts aren't repeatedly prefixed.
+      const worktreeNotice = pendingWorktreeNoticeRef.current;
+      if (worktreeNotice && !isSlashCommand(submittedValue)) {
+        pendingWorktreeNoticeRef.current = null;
+        submittedValue =
+          `<system-reminder>\n${worktreeNotice}\n</system-reminder>\n\n` +
+          submittedValue;
       }
       if (
         streamingState === StreamingState.Responding &&
@@ -957,6 +1716,14 @@ export const AppContainer = (props: AppContainerProps) => {
         speculationRef.current = IDLE_SPECULATION;
       }
 
+      if (
+        streamingState === StreamingState.Idle &&
+        isSlashCommand(submittedValue)
+      ) {
+        void submitQuery(submittedValue);
+        return;
+      }
+
       addMessage(submittedValue);
     },
     [
@@ -993,44 +1760,197 @@ export const AppContainer = (props: AppContainerProps) => {
     () => [...pendingSlashCommandHistoryItems, ...pendingGeminiHistoryItems],
     [pendingSlashCommandHistoryItems, pendingGeminiHistoryItems],
   );
+  const rawStickyTodos = useMemo(
+    () => getStickyTodos(historyManager.history, pendingHistoryItems),
+    [historyManager.history, pendingHistoryItems],
+  );
+  const stickyTodos = useStableStickyTodos(rawStickyTodos);
 
-  cancelHandlerRef.current = useCallback(() => {
-    const pendingHistoryItems = [
-      ...pendingSlashCommandHistoryItems,
-      ...pendingGeminiHistoryItems,
-    ];
-    if (isToolExecuting(pendingHistoryItems)) {
-      buffer.setText(''); // Just clear the prompt
-      return;
-    }
+  // Terminal tab progress bar (OSC 9;4) for iTerm2/Ghostty
+  useTerminalProgress(streamingState, isToolExecuting(pendingHistoryItems));
 
-    // Move any queued follow-up messages back into the buffer so the user
-    // can edit or resubmit them. Otherwise leave the buffer alone — in
-    // particular, do NOT repopulate it with the previous prompt; the user
-    // can still recall it via history navigation (Up/Ctrl+P).
-    //
-    // popAllMessages is atomic via the queue's synchronous ref, matching
-    // the drain behavior used during tool completion.
-    const popped = popAllMessages();
-    if (popped) {
-      const currentText = buffer.text;
-      // Preserve any in-progress draft the user typed since submitting (this
-      // is reachable via Ctrl+C cancel, which fires regardless of buffer
-      // content). Mirrors the popQueueIntoInput convention in InputPrompt.
-      buffer.setText(currentText ? `${popped}\n${currentText}` : popped);
-    }
-  }, [
-    buffer,
-    popAllMessages,
-    pendingSlashCommandHistoryItems,
-    pendingGeminiHistoryItems,
-  ]);
+  cancelHandlerRef.current = useCallback(
+    (info?: CancelSubmitInfo) => {
+      // Combine the React-state pending items (slash command, retry countdown,
+      // tool group, etc.) with the synchronous snapshot of the Gemini pending
+      // item from `useGeminiStream`. The snapshot closes the race where a
+      // stream chunk just set `pendingHistoryItem` but the consumer's React
+      // state still reads as empty — without it, auto-restore could wrongly
+      // truncate just-committed meaningful content.
+      const pendingHistoryItems: HistoryItemWithoutId[] = [
+        ...pendingSlashCommandHistoryItems,
+        ...pendingGeminiHistoryItems,
+      ];
+      if (info?.pendingItem) {
+        pendingHistoryItems.push(info.pendingItem);
+      }
+      const draftWasEmpty = buffer.text.length === 0;
+
+      // Always drain the queue back into the buffer (claude-code parity:
+      // popAllEditable preserves queued text on every cancel path, including
+      // tool-execution cancels — never silently drop the user's queued work).
+      const popped = popAllMessages();
+      if (popped) {
+        const currentText = buffer.text;
+        buffer.setText(currentText ? `${popped}\n${currentText}` : popped);
+      }
+
+      // Auto-restore-on-cancel: if the user hit ESC immediately after submit
+      // (nothing meaningful was produced), pull the just-submitted prompt back
+      // into the input box and rewind the transcript so it doesn't show a
+      // stranded "user prompt + Request cancelled." pair. Mirrors claude-code
+      // (REPL.tsx auto-restore branch).
+      //
+      // Guards (all required):
+      //   - Buffer was empty before the queue drain (don't clobber typed-during-
+      //     loading text).
+      //   - Queue was empty (popped === null): if the user queued more input,
+      //     they've moved on — don't undo their previous prompt.
+      //   - No pending stream item carries meaningful content. `tool_group` is
+      //     non-synthetic regardless of status (executing/canceled/done), so
+      //     this also covers the tool-execution cancel case.
+      //   - Items committed AFTER the last user prompt are all synthetic
+      //     (info/error/warning/cancel notice).
+      //
+      // truncateToItem is functional setState — it observes the latest queued
+      // history, including any INFO/pending item just appended by
+      // cancelOngoingRequest, and slices them all off together with the user
+      // item. No flicker because React batches with the same render pass.
+      // Each bail-out below is silent in production; toggle DEBUG=1 to
+      // diagnose "ESC pressed but my prompt didn't return to the input box"
+      // by reading which guard fired.
+      if (!draftWasEmpty) {
+        debugLogger.debug('auto-restore bail: buffer was non-empty');
+        return;
+      }
+      if (popped !== null) {
+        debugLogger.debug(
+          'auto-restore bail: queue had items (drained to buffer)',
+        );
+        return;
+      }
+      if (pendingHistoryItems.some((item) => !isSyntheticHistoryItem(item))) {
+        debugLogger.debug(
+          'auto-restore bail: pending stream item has meaningful content',
+        );
+        return;
+      }
+      // Synchronous "did the turn produce any content event" flag from
+      // useGeminiStream. Catches the race where the pre-cancel flush
+      // committed gemini_content via addItem and a later thought event
+      // overwrote pendingHistoryItem with a synthetic value — the
+      // committed text isn't in historyRef.current yet (React hasn't
+      // re-rendered), so the trailing-only-synthetic check below would
+      // otherwise pass and we'd wrongly truncate the committed content.
+      if (info?.turnProducedMeaningfulContent) {
+        debugLogger.debug(
+          'auto-restore bail: turn produced meaningful content during stream/flush',
+        );
+        return;
+      }
+
+      // The cancelled turn must have added a `user` history item itself —
+      // Cron / Notification / slash submit_prompt / Retry paths submit
+      // without pushing a user item, so an older user item that happens
+      // to be followed only by synthetic content must NOT be wrongly
+      // auto-restored on top of those turns.
+      const cancelledTurnUserItem = info?.lastTurnUserItem;
+      if (cancelledTurnUserItem == null) {
+        debugLogger.debug(
+          'auto-restore bail: cancelled turn did not add a user history item',
+        );
+        return;
+      }
+
+      const history = historyRef.current;
+      const lastUserIdx = findLastUserItemIndex(history);
+      if (lastUserIdx === -1) {
+        debugLogger.debug('auto-restore bail: no user item in history');
+        return;
+      }
+      if (!itemsAfterAreOnlySynthetic(history, lastUserIdx)) {
+        debugLogger.debug(
+          'auto-restore bail: meaningful content committed after last user item',
+        );
+        return;
+      }
+
+      const lastUserItem = history[lastUserIdx];
+      if (lastUserItem.type !== 'user') {
+        debugLogger.debug(
+          'auto-restore bail: lastUserItem type narrowing failed (unexpected)',
+        );
+        return;
+      }
+      // Identity match: the user item we're rewinding has to be the one
+      // this turn added. Use ID (not just text) so a consecutive-
+      // duplicate user submit — where `addItem` skipped insertion but
+      // still returned a fresh id — doesn't make this guard wrongly
+      // match an older identical-text USER row. Text is checked too as
+      // a cheap sanity belt.
+      if (
+        lastUserItem.id !== cancelledTurnUserItem.id ||
+        lastUserItem.text !== cancelledTurnUserItem.text
+      ) {
+        debugLogger.debug(
+          'auto-restore bail: lastUserItem identity does not match cancelled-turn user item',
+        );
+        return;
+      }
+      debugLogger.debug(
+        'auto-restore: rewinding cancelled turn and restoring prompt',
+      );
+      historyManager.truncateToItem(lastUserItem.id);
+      // Repaint the terminal so the cancelled `> prompt` and trailing
+      // INFO disappear from the static-rendered transcript. Ink's
+      // `<Static>` region is append-only — once a line has been printed,
+      // shrinking the underlying array doesn't unprint it. `refreshStatic`
+      // writes the ANSI clear-terminal escape AND bumps the static
+      // remount key so the next render reprints only the truncated
+      // history. Matches what `/clear` and `handleClearScreen` do for
+      // the same reason. Skipping this leaves the user seeing the
+      // cancelled prompt twice — once in scrollback and once pre-filled
+      // in the input buffer.
+      refreshStatic();
+      buffer.setText(lastUserItem.text);
+      // Third cleanup leg: the in-memory chat history. `GeminiChat`
+      // appends the user content before the stream generator runs, and
+      // the abort path doesn't pop it. Without this strip, the NEXT
+      // request's wire payload would carry the cancelled prompt as an
+      // orphan user turn alongside the new one — model context would
+      // contradict what the UI told the user was rewound. Mirrors the
+      // existing strip in the Retry submit path
+      // (GeminiClient.sendMessageStream).
+      geminiClient?.stripOrphanedUserEntriesFromHistory?.();
+      // Also undo the cross-session ↑-history disk entry written by
+      // useGeminiStream's `logger.logMessage` — otherwise
+      // getPreviousUserMessages would resurrect the cancelled prompt next
+      // session. Fire-and-forget; the UI restore must not block on disk
+      // I/O. Logger.removeLastUserMessage already swallows internal
+      // errors and returns false, but attach a .catch as defence so a
+      // future code path that throws doesn't surface as an
+      // UnhandledPromiseRejection.
+      void logger?.removeLastUserMessage().catch((err: unknown) => {
+        debugLogger.debug('Failed to undo cancelled prompt from log:', err);
+      });
+    },
+    [
+      buffer,
+      popAllMessages,
+      historyManager,
+      logger,
+      geminiClient,
+      refreshStatic,
+      pendingSlashCommandHistoryItems,
+      pendingGeminiHistoryItems,
+    ],
+  );
 
   const handleClearScreen = useCallback(() => {
     historyManager.clearItems();
     clearScreen();
-    refreshStatic();
-  }, [historyManager, refreshStatic]);
+    remountStaticHistory();
+  }, [historyManager, remountStaticHistory]);
 
   const { handleInput: vimHandleInput } = useVim(buffer, handleFinalSubmit);
 
@@ -1048,42 +1968,19 @@ export const AppContainer = (props: AppContainerProps) => {
     (streamingState === StreamingState.Idle ||
       streamingState === StreamingState.Responding);
 
-  const [controlsHeight, setControlsHeight] = useState(0);
-
-  useLayoutEffect(() => {
-    if (mainControlsRef.current) {
-      const fullFooterMeasurement = measureElement(mainControlsRef.current);
-      if (fullFooterMeasurement.height > 0) {
-        setControlsHeight(fullFooterMeasurement.height);
-      }
-    }
-  }, [buffer, terminalWidth, terminalHeight]);
-
-  // agentViewState is declared earlier (before handleFinalSubmit) so it
-  // is available for input routing. Referenced here for layout computation.
-
-  // Compute available terminal height based on controls measurement.
-  // When in-process agents are present the AgentTabBar renders an extra
-  // row at the top of the layout; subtract it so downstream consumers
-  // (shell, transcript, etc.) don't overestimate available space.
-  const tabBarHeight = agentViewState.agents.size > 0 ? 1 : 0;
-  const availableTerminalHeight = Math.max(
-    0,
-    terminalHeight - controlsHeight - staticExtraHeight - 2 - tabBarHeight,
-  );
-
-  config.setShellExecutionConfig({
-    terminalWidth: Math.floor(terminalWidth * SHELL_WIDTH_FRACTION),
-    terminalHeight: Math.max(
-      Math.floor(availableTerminalHeight - SHELL_HEIGHT_PADDING),
-      1,
-    ),
-    pager: settings.merged.tools?.shell?.pager,
-    showColor: settings.merged.tools?.shell?.showColor,
-  });
-
   const isFocused = useFocus();
   useBracketedPaste();
+
+  useAwaySummary({
+    enabled: settings.merged.general?.showSessionRecap ?? false,
+    config,
+    isFocused,
+    isIdle: streamingState === StreamingState.Idle,
+    addItem: historyManager.addItem,
+    history: historyManager.history,
+    awayThresholdMinutes:
+      settings.merged.general?.sessionRecapAwayThresholdMinutes,
+  });
 
   // Context file names computation
   const contextFileNames = useMemo(() => {
@@ -1097,16 +1994,6 @@ export const AppContainer = (props: AppContainerProps) => {
   // Initial prompt handling
   const initialPrompt = useMemo(() => config.getQuestion(), [config]);
   const initialPromptSubmitted = useRef(false);
-
-  useEffect(() => {
-    if (activePtyId) {
-      ShellExecutionService.resizePty(
-        activePtyId,
-        Math.floor(terminalWidth * SHELL_WIDTH_FRACTION),
-        Math.max(Math.floor(availableTerminalHeight - SHELL_HEIGHT_PADDING), 1),
-      );
-    }
-  }, [terminalWidth, availableTerminalHeight, activePtyId]);
 
   useEffect(() => {
     if (
@@ -1140,24 +2027,6 @@ export const AppContainer = (props: AppContainerProps) => {
   // Generate prompt suggestions when streaming completes
   const followupSuggestionsEnabled =
     settings.merged.ui?.enableFollowupSuggestions === true;
-
-  // Resolve fastModel, validating it belongs to the current authType.
-  // If the configured fastModel is from a different provider, the API call
-  // would fail silently (DashScope/Qwen client rejects unknown model IDs),
-  // so fall back to the main model instead.
-  const resolveFastModel = useCallback((): string | undefined => {
-    const fastModel = settings.merged.fastModel;
-    if (!fastModel) return undefined;
-    const currentAuthType = config.getContentGeneratorConfig()?.authType;
-    if (!currentAuthType) return undefined;
-    const availableModels = config
-      .getModelsConfig()
-      .getAvailableModelsForAuthType(currentAuthType);
-    const belongsToCurrentAuth = availableModels.some(
-      (m) => m.id === fastModel,
-    );
-    return belongsToCurrentAuth ? fastModel : undefined;
-  }, [settings.merged.fastModel, config]);
 
   useEffect(() => {
     // Clear suggestion when feature is disabled at runtime
@@ -1210,10 +2079,8 @@ export const AppContainer = (props: AppContainerProps) => {
       const fullHistory = geminiClient.getChat().getHistory(true);
       const conversationHistory =
         fullHistory.length > 40 ? fullHistory.slice(-40) : fullHistory;
-      const fastModel = resolveFastModel();
       generatePromptSuggestion(config, conversationHistory, ac.signal, {
         enableCacheSharing: settings.merged.ui?.enableCacheSharing === true,
-        model: fastModel,
       })
         .then((result) => {
           if (ac.signal.aborted) return;
@@ -1221,9 +2088,7 @@ export const AppContainer = (props: AppContainerProps) => {
             setPromptSuggestion(result.suggestion);
             // Start speculation if enabled (runs in background)
             if (settings.merged.ui?.enableSpeculation) {
-              startSpeculation(config, result.suggestion, ac.signal, {
-                model: fastModel,
-              })
+              startSpeculation(config, result.suggestion, ac.signal)
                 .then((state) => {
                   speculationRef.current = state;
                 })
@@ -1313,10 +2178,28 @@ export const AppContainer = (props: AppContainerProps) => {
   const [compactMode, setCompactMode] = useState<boolean>(
     settings.merged.ui?.compactMode ?? false,
   );
-  const [frozenSnapshot, setFrozenSnapshot] = useState<
-    HistoryItemWithoutId[] | null
-  >(null);
+  const configuredRenderMode = settings.merged.ui?.renderMode;
+  const [renderMode, setRenderMode] = useState<RenderMode>(
+    configuredRenderMode === 'raw' ? 'raw' : 'render',
+  );
+  const renderModeConfigMountedRef = useRef(false);
+  useEffect(() => {
+    if (!renderModeConfigMountedRef.current) {
+      renderModeConfigMountedRef.current = true;
+      return;
+    }
 
+    setRenderMode(configuredRenderMode === 'raw' ? 'raw' : 'render');
+  }, [configuredRenderMode]);
+  const renderModeMountedRef = useRef(false);
+  useEffect(() => {
+    if (!renderModeMountedRef.current) {
+      renderModeMountedRef.current = true;
+      return;
+    }
+
+    refreshStatic();
+  }, [renderMode, refreshStatic]);
   const [ctrlCPressedOnce, setCtrlCPressedOnce] = useState(false);
   const ctrlCTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [ctrlDPressedOnce, setCtrlDPressedOnce] = useState(false);
@@ -1324,6 +2207,8 @@ export const AppContainer = (props: AppContainerProps) => {
   const [escapePressedOnce, setEscapePressedOnce] = useState(false);
   const escapeTimerRef = useRef<NodeJS.Timeout | null>(null);
   const dialogsVisibleRef = useRef(false);
+  const [isRewindSelectorOpen, setIsRewindSelectorOpen] = useState(false);
+  const [rewindEscPending, setRewindEscPending] = useState(false);
   const [constrainHeight, setConstrainHeight] = useState<boolean>(true);
   const [ideContextState, setIdeContextState] = useState<
     IdeContext | undefined
@@ -1331,25 +2216,142 @@ export const AppContainer = (props: AppContainerProps) => {
   const [showEscapePrompt, setShowEscapePrompt] = useState(false);
   const [showIdeRestartPrompt, setShowIdeRestartPrompt] = useState(false);
 
-  useEffect(() => {
-    // Clear frozen snapshot when streaming ends OR when entering confirmation
-    // state. During WaitingForConfirmation, the user needs to see the latest
-    // pending items (including the confirmation message) rather than a stale snapshot.
-    if (
-      streamingState === StreamingState.Idle ||
-      streamingState === StreamingState.WaitingForConfirmation
-    ) {
-      setFrozenSnapshot(null);
-    }
-  }, [streamingState]);
-
   const { isFolderTrustDialogOpen, handleFolderTrustSelect, isRestarting } =
     useFolderTrust(settings, setIsTrustedFolder);
   const {
     needsRestart: ideNeedsRestart,
     restartReason: ideTrustRestartReason,
   } = useIdeTrustListener();
-  const isInitialMount = useRef(true);
+  const {
+    isFeedbackDialogOpen,
+    openFeedbackDialog,
+    closeFeedbackDialog,
+    temporaryCloseFeedbackDialog,
+    submitFeedback,
+  } = useFeedbackDialog({
+    config,
+    settings,
+    streamingState,
+    history: historyManager.history,
+    sessionStats,
+  });
+  const dialogsVisible =
+    showWelcomeBackDialog ||
+    shouldShowIdePrompt ||
+    shouldShowCommandMigrationNudge ||
+    isFolderTrustDialogOpen ||
+    !!shellConfirmationRequest ||
+    !!confirmationRequest ||
+    confirmUpdateExtensionRequests.length > 0 ||
+    !!providerUpdateRequest ||
+    settingInputRequests.length > 0 ||
+    pluginChoiceRequests.length > 0 ||
+    !!loopDetectionConfirmationRequest ||
+    isThemeDialogOpen ||
+    isSettingsDialogOpen ||
+    isStatusLineDialogOpen ||
+    isMemoryDialogOpen ||
+    isModelDialogOpen ||
+    isManageModelsDialogOpen ||
+    isTrustDialogOpen ||
+    activeArenaDialog !== null ||
+    isPermissionsDialogOpen ||
+    isAuthDialogOpen ||
+    isAuthenticating ||
+    isEditorDialogOpen ||
+    showIdeRestartPrompt ||
+    isSubagentCreateDialogOpen ||
+    isAgentsManagerDialogOpen ||
+    isMcpDialogOpen ||
+    isHooksDialogOpen ||
+    isApprovalModeDialogOpen ||
+    isResumeDialogOpen ||
+    isDeleteDialogOpen ||
+    isHelpDialogOpen ||
+    isExtensionsManagerDialogOpen ||
+    isRewindSelectorOpen ||
+    bgTasksDialogOpen ||
+    showWorktreeExitDialog;
+  dialogsVisibleRef.current = dialogsVisible;
+  const shouldShowStickyTodos =
+    stickyTodos !== null &&
+    !dialogsVisible &&
+    !isFeedbackDialogOpen &&
+    streamingState !== StreamingState.WaitingForConfirmation;
+  const stickyTodoWidth = Math.min(mainAreaWidth, 64);
+  const stickyTodoMaxVisibleItems =
+    getStickyTodoMaxVisibleItems(terminalHeight);
+  const stickyTodosLayoutKey = shouldShowStickyTodos
+    ? getStickyTodosLayoutKey(
+        stickyTodos,
+        stickyTodoWidth,
+        stickyTodoMaxVisibleItems,
+      )
+    : 'hidden';
+  const [controlsHeight, setControlsHeight] = useState(0);
+
+  useLayoutEffect(() => {
+    if (!mainControlsRef.current) {
+      setControlsHeight((previousHeight) =>
+        previousHeight === 0 ? previousHeight : 0,
+      );
+      return;
+    }
+
+    const fullFooterMeasurement = measureElement(mainControlsRef.current);
+    setControlsHeight((previousHeight) =>
+      previousHeight === fullFooterMeasurement.height
+        ? previousHeight
+        : fullFooterMeasurement.height,
+    );
+  }, [
+    buffer,
+    terminalWidth,
+    terminalHeight,
+    btwItem,
+    dialogsVisible,
+    stickyTodosLayoutKey,
+  ]);
+
+  // agentViewState is declared earlier (before handleFinalSubmit) so it
+  // is available for input routing. Referenced here for layout computation.
+  const tabBarHeight = agentViewState.agents.size > 0 ? 1 : 0;
+  const availableTerminalHeight = Math.max(
+    0,
+    terminalHeight - controlsHeight - staticExtraHeight - 2 - tabBarHeight,
+  );
+
+  config.setShellExecutionConfig({
+    terminalWidth: Math.floor(terminalWidth * SHELL_WIDTH_FRACTION),
+    terminalHeight: Math.max(
+      Math.floor(availableTerminalHeight - SHELL_HEIGHT_PADDING),
+      1,
+    ),
+    pager: settings.merged.tools?.shell?.pager,
+    showColor: settings.merged.tools?.shell?.showColor,
+  });
+  useEffect(() => {
+    if (activePtyId) {
+      ShellExecutionService.resizePty(
+        activePtyId,
+        Math.floor(terminalWidth * SHELL_WIDTH_FRACTION),
+        Math.max(Math.floor(availableTerminalHeight - SHELL_HEIGHT_PADDING), 1),
+      );
+    }
+  }, [terminalWidth, availableTerminalHeight, activePtyId]);
+
+  // Repaint static header on terminal resize. Without this, tmux pane
+  // resizes and fullscreen toggles leave the static region rendered at the
+  // old width — header content visibly tears until the next refreshStatic
+  // (e.g. /model). Cheap repaint (cursor-to + erase-down) rather than a
+  // full clearTerminal to avoid the full-screen flash.
+  useEffect(() => {
+    if (previousTerminalWidthRef.current === terminalWidth) {
+      return;
+    }
+    previousTerminalWidthRef.current = terminalWidth;
+    repaintStaticViewport();
+  }, [terminalWidth, repaintStaticViewport]);
 
   useEffect(() => {
     if (ideNeedsRestart) {
@@ -1357,21 +2359,6 @@ export const AppContainer = (props: AppContainerProps) => {
       setShowIdeRestartPrompt(true);
     }
   }, [ideNeedsRestart]);
-
-  useEffect(() => {
-    if (isInitialMount.current) {
-      isInitialMount.current = false;
-      return;
-    }
-
-    const handler = setTimeout(() => {
-      refreshStatic();
-    }, 300);
-
-    return () => {
-      clearTimeout(handler);
-    };
-  }, [terminalWidth, refreshStatic]);
 
   useEffect(() => {
     const unsubscribe = ideContextStore.subscribe(setIdeContextState);
@@ -1382,6 +2369,224 @@ export const AppContainer = (props: AppContainerProps) => {
   const handleEscapePromptChange = useCallback((showPrompt: boolean) => {
     setShowEscapePrompt(showPrompt);
   }, []);
+
+  // --- Rewind selector callbacks ---
+  // IDE guard here is NOT redundant with the keyboard handler guard (line ~2375):
+  // /rewind calls openRewindSelector directly, bypassing the keyboard handler.
+  const openRewindSelector = useCallback(() => {
+    if (streamingState !== StreamingState.Idle) return;
+    if (dialogsVisibleRef.current) return;
+    if (config.getIdeMode()) {
+      historyManager.addItem(
+        {
+          type: 'info',
+          text: 'Rewind is disabled in IDE mode.',
+        },
+        Date.now(),
+      );
+      return;
+    }
+    const hasUserTurns = historyManager.history.some((h) => h.type === 'user');
+    if (!hasUserTurns) return;
+    setIsRewindSelectorOpen(true);
+  }, [streamingState, config, historyManager]);
+  openRewindSelectorRef.current = openRewindSelector;
+
+  const closeRewindSelector = useCallback(() => {
+    setIsRewindSelectorOpen(false);
+  }, []);
+
+  const handleRewindConfirm = useCallback(
+    async (userItem: HistoryItem, option: RestoreOption) => {
+      try {
+        // For 'both', validate that conversation can be truncated BEFORE
+        // touching files — otherwise we'd roll back the workspace while
+        // the conversation stays at the newer state.
+        const needsConversation =
+          option === 'conversation' || option === 'both';
+        const geminiClient = needsConversation
+          ? config.getGeminiClient()
+          : null;
+        let apiTruncateIndex = -1;
+        let conversationSkippedNoClient = false;
+        if (needsConversation) {
+          if (!geminiClient) {
+            if (option === 'conversation') {
+              historyManager.addItem(
+                {
+                  type: 'error',
+                  text: t(
+                    'Cannot rewind conversation: no active model client.',
+                  ),
+                },
+                Date.now(),
+              );
+              return;
+            }
+            // 'both' with no client: skip conversation, still try files,
+            // and surface a warning after the restore output.
+            conversationSkippedNoClient = true;
+          } else {
+            apiTruncateIndex = computeApiTruncationIndex(
+              historyManager.history,
+              userItem.id,
+              geminiClient.getHistory(),
+            );
+            if (apiTruncateIndex < 0) {
+              historyManager.addItem(
+                {
+                  type: 'error',
+                  text: t(
+                    'Cannot rewind to a turn that was compressed. Try a more recent turn.',
+                  ),
+                },
+                Date.now(),
+              );
+              if (option === 'both') {
+                // Abort file restore too — don't create inconsistent state
+                return;
+              }
+              return;
+            }
+          }
+        }
+
+        // Restore code (files on disk). For 'code'-only, don't truncate
+        // the snapshot timeline — the conversation turns remain visible
+        // and their snapshots must stay available for future rewinds.
+        let fileRestoreMessage: string | undefined;
+        let fileRestoreError: string | undefined;
+        let hasRestoreFailure = false;
+        if (option === 'code' || option === 'both') {
+          const promptId = (userItem as HistoryItemUser).promptId;
+          if (promptId) {
+            try {
+              const truncateHistory =
+                option === 'both' && !!geminiClient && apiTruncateIndex >= 0;
+              const result = await config
+                .getFileHistoryService()
+                .rewind(promptId, truncateHistory);
+              if (result.filesChanged.length > 0) {
+                fileRestoreMessage = t('Restored {{count}} file(s).', {
+                  count: String(result.filesChanged.length),
+                });
+              } else if (result.filesFailed.length === 0) {
+                fileRestoreMessage = t('No files needed to be restored.');
+              }
+              if (result.filesFailed.length > 0) {
+                hasRestoreFailure = true;
+                fileRestoreError = t(
+                  'Failed to restore {{count}} file(s): {{files}}',
+                  {
+                    count: String(result.filesFailed.length),
+                    files: result.filesFailed
+                      .map((f) => f.split('/').pop())
+                      .join(', '),
+                  },
+                );
+              }
+            } catch (error) {
+              hasRestoreFailure = true;
+              fileRestoreError = t('Failed to restore files: {{error}}', {
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          } else {
+            hasRestoreFailure = true;
+            fileRestoreError = t(
+              'Cannot restore files: this turn was created before file checkpointing was enabled.',
+            );
+          }
+        }
+
+        // Truncate conversation (already validated above).
+        // Skip if file restore had failures in "both" mode to avoid inconsistent state.
+        if (
+          needsConversation &&
+          geminiClient &&
+          apiTruncateIndex >= 0 &&
+          !(option === 'both' && hasRestoreFailure)
+        ) {
+          const originalHistory = historyManager.history;
+          const originalLength = originalHistory.length;
+
+          let targetTurnIndex = 0;
+          for (const h of originalHistory) {
+            if (h.id === userItem.id) break;
+            if (isRealUserTurn(h)) targetTurnIndex++;
+          }
+
+          geminiClient.truncateHistory(apiTruncateIndex);
+
+          const truncatedUi = originalHistory.filter((h) => h.id < userItem.id);
+          historyManager.loadHistory(truncatedUi);
+
+          refreshStatic();
+
+          if (userItem.type === 'user' && userItem.text) {
+            buffer.setText(userItem.text);
+          }
+
+          historyManager.addItem(
+            {
+              type: 'info',
+              text: t(
+                'Conversation rewound. Edit your prompt and press Enter to continue.',
+              ),
+            },
+            Date.now(),
+          );
+
+          config.getChatRecordingService()?.rewindRecording(targetTurnIndex, {
+            truncatedCount: originalLength - truncatedUi.length,
+          });
+        }
+
+        // Show file restore result after conversation truncation so the
+        // message isn't immediately removed by loadHistory.
+        if (fileRestoreMessage) {
+          historyManager.addItem(
+            { type: 'info', text: fileRestoreMessage },
+            Date.now(),
+          );
+        }
+        if (fileRestoreError) {
+          historyManager.addItem(
+            { type: 'error', text: fileRestoreError },
+            Date.now(),
+          );
+        }
+        if (conversationSkippedNoClient) {
+          historyManager.addItem(
+            {
+              type: 'info',
+              text: t(
+                'Code restored, but conversation could not be rewound (no active client).',
+              ),
+            },
+            Date.now(),
+          );
+        }
+      } catch (error) {
+        historyManager.addItem(
+          {
+            type: 'error',
+            text: t('Rewind failed: {{error}}', {
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          },
+          Date.now(),
+        );
+      } finally {
+        setIsRewindSelectorOpen(false);
+      }
+    },
+    [config, historyManager, refreshStatic, buffer],
+  );
+
+  const handleDoubleEscRewind = useDoublePress(openRewindSelector, (pending) =>
+    setRewindEscPending(pending),
+  );
 
   const handleIdePromptComplete = useCallback(
     (result: IdeIntegrationNudgeResult) => {
@@ -1504,6 +2709,8 @@ export const AppContainer = (props: AppContainerProps) => {
     elapsedTime,
     settings,
     config,
+    terminal,
+    pendingToolCalls,
   });
 
   // Dialog close functionality
@@ -1519,11 +2726,21 @@ export const AppContainer = (props: AppContainerProps) => {
     exitEditorDialog,
     isSettingsDialogOpen,
     closeSettingsDialog,
+    isStatusLineDialogOpen,
+    closeStatusLineDialog,
+    isMemoryDialogOpen,
+    closeMemoryDialog,
     activeArenaDialog,
     closeArenaDialog,
     isFolderTrustDialogOpen,
     showWelcomeBackDialog,
     handleWelcomeBackClose,
+    isHelpDialogOpen,
+    closeHelpDialog,
+    isBackgroundTasksDialogOpen: bgTasksDialogOpen,
+    closeBackgroundTasksDialog: closeBgTasksDialog,
+    showWorktreeExitDialog,
+    closeWorktreeExitDialog: () => setShowWorktreeExitDialog(false),
   });
 
   const handleExit = useCallback(
@@ -1532,10 +2749,18 @@ export const AppContainer = (props: AppContainerProps) => {
       setPressedOnce: (value: boolean) => void,
       timerRef: React.MutableRefObject<NodeJS.Timeout | null>,
     ) => {
-      // Fast double-press: Direct quit (preserve user habit)
+      // Fast double-press: Direct quit (preserve user habit) — unless the
+      // session is inside an active worktree, in which case intercept and
+      // show WorktreeExitDialog so the user explicitly decides keep vs
+      // remove before the process exits.
       if (pressedOnce) {
         if (timerRef.current) {
           clearTimeout(timerRef.current);
+        }
+        if (activeWorktree) {
+          setShowWorktreeExitDialog(true);
+          setPressedOnce(false);
+          return;
         }
         // Exit directly
         handleSlashCommand('/quit');
@@ -1596,6 +2821,7 @@ export const AppContainer = (props: AppContainerProps) => {
       streamingState,
       cancelOngoingRequest,
       buffer,
+      activeWorktree,
     ],
   );
 
@@ -1664,13 +2890,33 @@ export const AppContainer = (props: AppContainerProps) => {
         }
 
         // Input is empty, cancel request immediately (no double-press needed)
-        if (streamingState === StreamingState.Responding) {
+        // Skip when a dialog (background tasks, etc.) is open — ESC should
+        // close the dialog, not cancel the running request.
+        if (
+          streamingState === StreamingState.Responding &&
+          !dialogsVisibleRef.current
+        ) {
           if (escapeTimerRef.current) {
             clearTimeout(escapeTimerRef.current);
             escapeTimerRef.current = null;
           }
           cancelOngoingRequest?.();
           setEscapePressedOnce(false);
+          return;
+        }
+
+        // Input is empty and idle — double-ESC opens rewind selector
+        if (
+          streamingState === StreamingState.Idle &&
+          !dialogsVisibleRef.current &&
+          !config.getIdeMode()
+        ) {
+          if (escapeTimerRef.current) {
+            clearTimeout(escapeTimerRef.current);
+            escapeTimerRef.current = null;
+          }
+          setEscapePressedOnce(false);
+          handleDoubleEscRewind();
           return;
         }
 
@@ -1706,7 +2952,9 @@ export const AppContainer = (props: AppContainerProps) => {
         setConstrainHeight(true);
       }
 
-      if (keyMatchers[Command.TOGGLE_TOOL_DESCRIPTIONS](key)) {
+      if (handleRenderModeToggleKey(key, setRenderMode)) {
+        return;
+      } else if (keyMatchers[Command.TOGGLE_TOOL_DESCRIPTIONS](key)) {
         const newValue = !showToolDescriptions;
         setShowToolDescriptions(newValue);
 
@@ -1733,14 +2981,69 @@ export const AppContainer = (props: AppContainerProps) => {
         const newValue = !compactMode;
         setCompactMode(newValue);
         void settings.setValue(SettingScope.User, 'ui.compactMode', newValue);
-        refreshStatic();
-        // Only freeze during the actual responding phase. WaitingForConfirmation
-        // must keep focus so the user can approve/cancel tool confirmation UI.
-        if (streamingState === StreamingState.Responding) {
-          setFrozenSnapshot([...pendingHistoryItems]);
-        } else {
-          setFrozenSnapshot(null);
+        // Skip the expensive clearTerminal + Static remount when no past
+        // item would render differently (no tool_group / gemini_thought*).
+        // Future items pick up the new mode naturally because Static is
+        // append-only. Issue #3899: this unfreezes Ctrl+O for plain-chat
+        // long sessions; tool/thinking-bearing sessions still go through
+        // the (now chunked) full path in MainContent.
+        if (compactToggleHasVisualEffect(historyRef.current)) {
+          refreshStatic();
         }
+      } else if (keyMatchers[Command.PROMOTE_SHELL_TO_BACKGROUND](key)) {
+        // Ctrl+B: promote a running foreground shell command to a
+        // background task (#3831). The child keeps running, the
+        // agent's turn unblocks, and the shell becomes a regular
+        // BackgroundShellEntry visible in `/tasks` + the dialog and
+        // stoppable via `task_stop`.
+        //
+        // Read from the ref (NOT the destructured `pendingToolCalls`)
+        // so we don't have to put `pendingToolCalls` in the deps
+        // array — that would re-bind the keypress handler on every
+        // tool-call status update, which is noisy.
+        //
+        // No-op when no foreground shell is currently executing OR
+        // the executing tool call is non-shell (no
+        // `promoteAbortController` projected). Falling through in
+        // the no-op case is intentional: while the agent is idle the
+        // input layer's own Ctrl+B handler (cursor-left in the
+        // prompt) should still fire as before.
+        //
+        // Broadcast caveat: `KeypressContext.broadcast()` has no
+        // consumed-flag mechanism today, so even after we `return`
+        // here the same Ctrl+B keypress is also dispatched to other
+        // useKeypress consumers (text buffer cursor-left,
+        // DebugProfiler, etc.). Visible side effect during a
+        // successful promote: the input cursor will move one
+        // character left if the prompt has focus. Cosmetic; tracked
+        // for a follow-up that introduces a `consumed` return value
+        // on KeypressHandler so global handlers can swallow keys.
+        const executingShell = pendingToolCallsRef.current.find(
+          (tc) =>
+            tc.status === 'executing' &&
+            // Defense-in-depth: also gate on the tool name. Today only
+            // the shell tool's invocation wires `promoteAbortController`,
+            // but a future copy-paste / type-confusion that adds the
+            // property to a non-shell tool would otherwise let Ctrl+B
+            // mistakenly fire `abort({kind:'background'})` on a tool
+            // whose service has no promote-handoff handler.
+            tc.request.name === ToolNames.SHELL &&
+            tc.promoteAbortController !== undefined,
+        ) as TrackedExecutingToolCall | undefined;
+        if (executingShell?.promoteAbortController) {
+          debugLogger.debug(
+            `Ctrl+B promote: matched executing shell tool call ${executingShell.request.callId}`,
+          );
+          executingShell.promoteAbortController.abort({
+            kind: 'background',
+          });
+          return;
+        }
+        debugLogger.debug(
+          `Ctrl+B promote: no executing shell tool call; falling through ` +
+            `(streamingState=${streamingState}, ` +
+            `pendingToolCalls=${pendingToolCallsRef.current.length})`,
+        );
       }
     },
     [
@@ -1776,9 +3079,9 @@ export const AppContainer = (props: AppContainerProps) => {
       isAuthenticating,
       compactMode,
       setCompactMode,
-      setFrozenSnapshot,
-      pendingHistoryItems,
+      setRenderMode,
       refreshStatic,
+      handleDoubleEscRewind,
     ],
   );
 
@@ -1820,52 +3123,40 @@ export const AppContainer = (props: AppContainerProps) => {
     stdout,
   ]);
 
-  const nightly = props.version.includes('nightly');
+  // Drain queued messages when idle. `queueDrainNonce` re-fires the effect
+  // after each submission settles so multi-step queues drain end-to-end.
+  const queueDrainingRef = useRef(false);
+  const [queueDrainNonce, setQueueDrainNonce] = useState(0);
+  useEffect(() => {
+    if (queueDrainingRef.current) return;
+    if (!isConfigInitialized) return;
+    if (streamingState !== StreamingState.Idle) return;
+    if (dialogsVisible) return;
+    if (messageQueue.length === 0) return;
 
-  const dialogsVisible =
-    showWelcomeBackDialog ||
-    shouldShowIdePrompt ||
-    shouldShowCommandMigrationNudge ||
-    isFolderTrustDialogOpen ||
-    !!shellConfirmationRequest ||
-    !!confirmationRequest ||
-    confirmUpdateExtensionRequests.length > 0 ||
-    !!codingPlanUpdateRequest ||
-    settingInputRequests.length > 0 ||
-    pluginChoiceRequests.length > 0 ||
-    !!loopDetectionConfirmationRequest ||
-    isThemeDialogOpen ||
-    isSettingsDialogOpen ||
-    isModelDialogOpen ||
-    isTrustDialogOpen ||
-    activeArenaDialog !== null ||
-    isPermissionsDialogOpen ||
-    isAuthDialogOpen ||
-    isAuthenticating ||
-    isEditorDialogOpen ||
-    showIdeRestartPrompt ||
-    isSubagentCreateDialogOpen ||
-    isAgentsManagerDialogOpen ||
-    isMcpDialogOpen ||
-    isHooksDialogOpen ||
-    isApprovalModeDialogOpen ||
-    isResumeDialogOpen ||
-    isExtensionsManagerDialogOpen;
-  dialogsVisibleRef.current = dialogsVisible;
+    // Two-phase: batch plain prompts as one turn, else pop next slash command.
+    const plainPrompts = drainQueue();
+    const submission =
+      plainPrompts.length > 0 ? plainPrompts.join('\n\n') : popNextSegment();
+    if (submission === null) return;
 
-  const {
-    isFeedbackDialogOpen,
-    openFeedbackDialog,
-    closeFeedbackDialog,
-    temporaryCloseFeedbackDialog,
-    submitFeedback,
-  } = useFeedbackDialog({
-    config,
-    settings,
+    queueDrainingRef.current = true;
+    Promise.resolve(submitQuery(submission)).finally(() => {
+      queueDrainingRef.current = false;
+      setQueueDrainNonce((n) => n + 1);
+    });
+  }, [
+    isConfigInitialized,
     streamingState,
-    history: historyManager.history,
-    sessionStats,
-  });
+    dialogsVisible,
+    messageQueue,
+    drainQueue,
+    popNextSegment,
+    submitQuery,
+    queueDrainNonce,
+  ]);
+
+  const nightly = props.version.includes('nightly');
 
   const uiState: UIState = useMemo(
     () => ({
@@ -1873,32 +3164,37 @@ export const AppContainer = (props: AppContainerProps) => {
       historyManager,
       isThemeDialogOpen,
       themeError,
-      isAuthenticating,
+      auth: authState,
       isConfigInitialized,
-      authError,
-      isAuthDialogOpen,
-      pendingAuthType,
-      // Qwen OAuth state
-      qwenAuthState,
       editorError,
       isEditorDialogOpen,
       debugMessage,
       quittingMessages,
       isSettingsDialogOpen,
+      isStatusLineDialogOpen,
+      statusLineSettingsVersion,
+      statusLineConfigOverride,
+      isMemoryDialogOpen,
       isModelDialogOpen,
       isFastModelMode,
+      isManageModelsDialogOpen,
       isTrustDialogOpen,
       activeArenaDialog,
       isPermissionsDialogOpen,
       isApprovalModeDialogOpen,
       isResumeDialogOpen,
+      resumeMatchedSessions,
+      isDeleteDialogOpen,
+      isHelpDialogOpen,
+      activeHelpTab,
       slashCommands,
+      recentSlashCommands,
       pendingSlashCommandHistoryItems,
       commandContext,
       shellConfirmationRequest,
       confirmationRequest,
       confirmUpdateExtensionRequests,
-      codingPlanUpdateRequest,
+      providerUpdateRequest,
       settingInputRequests,
       pluginChoiceRequests,
       loopDetectionConfirmationRequest,
@@ -1938,11 +3234,14 @@ export const AppContainer = (props: AppContainerProps) => {
       staticExtraHeight,
       dialogsVisible,
       pendingHistoryItems,
+      stickyTodos,
       btwItem,
       setBtwItem,
       cancelBtw,
       nightly,
       branchName,
+      activeWorktree,
+      showWorktreeExitDialog,
       sessionStats,
       terminalWidth,
       terminalHeight,
@@ -1972,39 +3271,53 @@ export const AppContainer = (props: AppContainerProps) => {
       isFeedbackDialogOpen,
       // Per-task token tracking
       taskStartTokens,
+      // Real-time token display
+      streamingResponseLengthRef,
+      isReceivingContent,
+      // Session name
+      sessionName,
+      setSessionName,
       // Prompt suggestion
       promptSuggestion,
       dismissPromptSuggestion,
+      // Rewind selector
+      isRewindSelectorOpen,
+      rewindEscPending,
     }),
     [
       isThemeDialogOpen,
       themeError,
-      isAuthenticating,
+      authState,
       isConfigInitialized,
-      authError,
-      isAuthDialogOpen,
-      pendingAuthType,
-      // Qwen OAuth state
-      qwenAuthState,
       editorError,
       isEditorDialogOpen,
       debugMessage,
       quittingMessages,
       isSettingsDialogOpen,
+      isStatusLineDialogOpen,
+      statusLineSettingsVersion,
+      statusLineConfigOverride,
+      isMemoryDialogOpen,
       isModelDialogOpen,
       isFastModelMode,
+      isManageModelsDialogOpen,
       isTrustDialogOpen,
       activeArenaDialog,
       isPermissionsDialogOpen,
       isApprovalModeDialogOpen,
       isResumeDialogOpen,
+      resumeMatchedSessions,
+      isDeleteDialogOpen,
+      isHelpDialogOpen,
+      activeHelpTab,
       slashCommands,
+      recentSlashCommands,
       pendingSlashCommandHistoryItems,
       commandContext,
       shellConfirmationRequest,
       confirmationRequest,
       confirmUpdateExtensionRequests,
-      codingPlanUpdateRequest,
+      providerUpdateRequest,
       settingInputRequests,
       pluginChoiceRequests,
       loopDetectionConfirmationRequest,
@@ -2043,11 +3356,14 @@ export const AppContainer = (props: AppContainerProps) => {
       staticExtraHeight,
       dialogsVisible,
       pendingHistoryItems,
+      stickyTodos,
       btwItem,
       setBtwItem,
       cancelBtw,
       nightly,
       branchName,
+      activeWorktree,
+      showWorktreeExitDialog,
       sessionStats,
       terminalWidth,
       terminalHeight,
@@ -2079,9 +3395,18 @@ export const AppContainer = (props: AppContainerProps) => {
       isFeedbackDialogOpen,
       // Per-task token tracking
       taskStartTokens,
+      // Real-time token display
+      streamingResponseLengthRef,
+      isReceivingContent,
+      // Session name
+      sessionName,
+      setSessionName,
       // Prompt suggestion
       promptSuggestion,
       dismissPromptSuggestion,
+      // Rewind selector
+      isRewindSelectorOpen,
+      rewindEscPending,
     ],
   );
 
@@ -2089,24 +3414,25 @@ export const AppContainer = (props: AppContainerProps) => {
     () => ({
       openThemeDialog,
       openEditorDialog,
+      openMemoryDialog,
       handleThemeSelect,
       handleThemeHighlight,
       handleApprovalModeSelect,
-      handleAuthSelect,
-      setAuthState,
-      onAuthError,
-      cancelAuthentication,
-      handleCodingPlanSubmit,
-      handleAlibabaStandardSubmit,
+      auth: authActions,
       handleEditorSelect,
       exitEditorDialog,
       closeSettingsDialog,
+      closeStatusLineDialog,
+      notifyStatusLineSettingsChanged,
+      closeMemoryDialog,
       closeModelDialog,
       openModelDialog,
+      openManageModelsDialog,
+      closeManageModelsDialog,
       openArenaDialog,
       closeArenaDialog,
       handleArenaModelsSelected,
-      dismissCodingPlanUpdate,
+      dismissProviderUpdate,
       closeTrustDialog,
       closePermissionsDialog,
       setShellModeActive,
@@ -2116,7 +3442,7 @@ export const AppContainer = (props: AppContainerProps) => {
       handleFolderTrustSelect,
       setConstrainHeight,
       onEscapePromptChange: handleEscapePromptChange,
-      onSuggestionsVisibilityChange: setHasSuggestionsVisible,
+      onTabConsumerChange: setHasTabConsumer,
       refreshStatic,
       handleFinalSubmit,
       handleRetryLastPrompt: retryLastPrompt,
@@ -2125,6 +3451,8 @@ export const AppContainer = (props: AppContainerProps) => {
       // Welcome back dialog
       handleWelcomeBackSelection,
       handleWelcomeBackClose,
+      // Worktree exit dialog
+      handleWorktreeExit,
       // Subagent dialogs
       closeSubagentCreateDialog,
       closeAgentsManagerDialog,
@@ -2140,33 +3468,49 @@ export const AppContainer = (props: AppContainerProps) => {
       openResumeDialog,
       closeResumeDialog,
       handleResume,
+      // Branch (fork) session
+      handleBranch,
+      // Delete session dialog
+      openDeleteDialog,
+      closeDeleteDialog,
+      handleDelete,
+      handleDeleteMany,
+      // Help dialog
+      openHelpDialog,
+      closeHelpDialog,
+      setHelpTab,
       // Feedback dialog
       openFeedbackDialog,
       closeFeedbackDialog,
       temporaryCloseFeedbackDialog,
       submitFeedback,
+      // Rewind selector
+      openRewindSelector,
+      closeRewindSelector,
+      handleRewindConfirm,
     }),
     [
       openThemeDialog,
       openEditorDialog,
+      openMemoryDialog,
       handleThemeSelect,
       handleThemeHighlight,
       handleApprovalModeSelect,
-      handleAuthSelect,
-      setAuthState,
-      onAuthError,
-      cancelAuthentication,
-      handleCodingPlanSubmit,
-      handleAlibabaStandardSubmit,
+      authActions,
       handleEditorSelect,
       exitEditorDialog,
       closeSettingsDialog,
+      closeStatusLineDialog,
+      notifyStatusLineSettingsChanged,
+      closeMemoryDialog,
       closeModelDialog,
       openModelDialog,
+      openManageModelsDialog,
+      closeManageModelsDialog,
       openArenaDialog,
       closeArenaDialog,
       handleArenaModelsSelected,
-      dismissCodingPlanUpdate,
+      dismissProviderUpdate,
       closeTrustDialog,
       closePermissionsDialog,
       setShellModeActive,
@@ -2183,6 +3527,7 @@ export const AppContainer = (props: AppContainerProps) => {
       popAllMessages,
       handleWelcomeBackSelection,
       handleWelcomeBackClose,
+      handleWorktreeExit,
       // Subagent dialogs
       closeSubagentCreateDialog,
       closeAgentsManagerDialog,
@@ -2198,17 +3543,36 @@ export const AppContainer = (props: AppContainerProps) => {
       openResumeDialog,
       closeResumeDialog,
       handleResume,
+      // Branch (fork) session
+      handleBranch,
+      // Delete session dialog
+      openDeleteDialog,
+      closeDeleteDialog,
+      handleDelete,
+      handleDeleteMany,
+      // Help dialog
+      openHelpDialog,
+      closeHelpDialog,
+      setHelpTab,
       // Feedback dialog
       openFeedbackDialog,
       closeFeedbackDialog,
       temporaryCloseFeedbackDialog,
       submitFeedback,
+      // Rewind selector
+      openRewindSelector,
+      closeRewindSelector,
+      handleRewindConfirm,
     ],
   );
 
   const compactModeValue = useMemo(
-    () => ({ compactMode, frozenSnapshot }),
-    [compactMode, frozenSnapshot],
+    () => ({ compactMode, setCompactMode }),
+    [compactMode, setCompactMode],
+  );
+  const renderModeValue = useMemo(
+    () => ({ renderMode, setRenderMode }),
+    [renderMode, setRenderMode],
   );
 
   return (
@@ -2222,9 +3586,13 @@ export const AppContainer = (props: AppContainerProps) => {
             }}
           >
             <CompactModeProvider value={compactModeValue}>
-              <ShellFocusContext.Provider value={isFocused}>
-                <App />
-              </ShellFocusContext.Provider>
+              <RenderModeProvider value={renderModeValue}>
+                <TerminalOutputProvider value={writeRaw}>
+                  <ShellFocusContext.Provider value={isFocused}>
+                    <App />
+                  </ShellFocusContext.Provider>
+                </TerminalOutputProvider>
+              </RenderModeProvider>
             </CompactModeProvider>
           </AppContext.Provider>
         </ConfigContext.Provider>

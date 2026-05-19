@@ -8,13 +8,16 @@ import type { Config } from '@qwen-code/qwen-code-core';
 import {
   createDebugLogger,
   appendToLastTextPart,
+  buildSkillLlmContent,
 } from '@qwen-code/qwen-code-core';
+import { dirname } from 'node:path';
 import type { ICommandLoader } from './types.js';
 import type {
   SlashCommand,
   SlashCommandActionReturn,
 } from '../ui/commands/types.js';
 import { CommandKind } from '../ui/commands/types.js';
+import { t } from '../i18n/index.js';
 
 const debugLogger = createDebugLogger('BUNDLED_SKILL_LOADER');
 
@@ -26,6 +29,11 @@ export class BundledSkillLoader implements ICommandLoader {
   constructor(private readonly config: Config | null) {}
 
   async loadCommands(_signal: AbortSignal): Promise<SlashCommand[]> {
+    if (this.config?.getBareMode?.()) {
+      debugLogger.debug('Bare mode enabled, skipping bundled skills');
+      return [];
+    }
+
     const skillManager = this.config?.getSkillManager();
     if (!skillManager) {
       debugLogger.debug('SkillManager not available, skipping bundled skills');
@@ -57,7 +65,13 @@ export class BundledSkillLoader implements ICommandLoader {
       return skills.map((skill) => ({
         name: skill.name,
         description: skill.description,
+        modelDescription: skill.description,
         kind: CommandKind.SKILL,
+        source: 'bundled-skill' as const,
+        sourceLabel: t('Skill'),
+        modelInvocable: !skill.disableModelInvocation,
+        argumentHint: skill.argumentHint,
+        whenToUse: skill.whenToUse,
         action: async (context, _args): Promise<SlashCommandActionReturn> => {
           // Resolve template variables in skill body
           let body = skill.body;
@@ -72,9 +86,16 @@ export class BundledSkillLoader implements ICommandLoader {
             }
           }
 
+          const skillPrompt = buildSkillLlmContent(
+            dirname(skill.filePath),
+            body,
+          );
           const content = context.invocation?.args
-            ? appendToLastTextPart([{ text: body }], context.invocation.raw)
-            : [{ text: body }];
+            ? appendToLastTextPart(
+                [{ text: skillPrompt }],
+                context.invocation.raw,
+              )
+            : [{ text: skillPrompt }];
 
           return {
             type: 'submit_prompt',

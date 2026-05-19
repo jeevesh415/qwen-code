@@ -8,13 +8,13 @@ import { renderWithProviders } from '../../test-utils/render.js';
 import { waitFor, act } from '@testing-library/react';
 import type { InputPromptProps } from './InputPrompt.js';
 import { InputPrompt } from './InputPrompt.js';
-import type { TextBuffer } from './shared/text-buffer.js';
+import { useTextBuffer, type TextBuffer } from './shared/text-buffer.js';
 import type { Config } from '@qwen-code/qwen-code-core';
 import { ApprovalMode } from '@qwen-code/qwen-code-core';
 import * as path from 'node:path';
 import type { CommandContext, SlashCommand } from '../commands/types.js';
 import { CommandKind } from '../commands/types.js';
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest';
 import type { UseShellHistoryReturn } from '../hooks/useShellHistory.js';
 import { useShellHistory } from '../hooks/useShellHistory.js';
 import type { UseCommandCompletionReturn } from '../hooks/useCommandCompletion.js';
@@ -29,6 +29,19 @@ import stripAnsi from 'strip-ansi';
 import chalk from 'chalk';
 import { useUIState } from '../contexts/UIStateContext.js';
 import { useUIActions } from '../contexts/UIActionsContext.js';
+import {
+  useAgentViewActions,
+  useAgentViewState,
+} from '../contexts/AgentViewContext.js';
+import {
+  useBackgroundTaskViewActions,
+  useBackgroundTaskViewState,
+} from '../contexts/BackgroundTaskViewContext.js';
+
+const mockViewActions = vi.hoisted(() => ({
+  setAgentTabBarFocused: vi.fn(),
+  setBgPillFocused: vi.fn(),
+}));
 
 vi.mock('../hooks/useShellHistory.js');
 vi.mock('../hooks/useCommandCompletion.js');
@@ -43,6 +56,31 @@ vi.mock('../contexts/UIActionsContext.js', () => ({
     handleRetryLastPrompt: vi.fn(),
     temporaryCloseFeedbackDialog: vi.fn(),
     popAllQueuedMessages: vi.fn(() => null),
+  })),
+}));
+vi.mock('../contexts/AgentViewContext.js', () => ({
+  useAgentViewState: vi.fn(() => ({
+    activeView: 'main',
+    agents: new Map(),
+    agentShellFocused: false,
+    agentInputBufferText: '',
+    agentTabBarFocused: false,
+    agentApprovalModes: new Map(),
+  })),
+  useAgentViewActions: vi.fn(() => ({
+    setAgentTabBarFocused: mockViewActions.setAgentTabBarFocused,
+  })),
+}));
+vi.mock('../contexts/BackgroundTaskViewContext.js', () => ({
+  useBackgroundTaskViewState: vi.fn(() => ({
+    entries: [],
+    selectedIndex: 0,
+    dialogMode: 'closed',
+    dialogOpen: false,
+    pillFocused: false,
+  })),
+  useBackgroundTaskViewActions: vi.fn(() => ({
+    setPillFocused: mockViewActions.setBgPillFocused,
   })),
 }));
 
@@ -78,6 +116,38 @@ const mockSlashCommands: SlashCommand[] = [
       },
     ],
   },
+  {
+    name: 'export',
+    kind: CommandKind.BUILT_IN,
+    description: 'Export session',
+    action: vi.fn(),
+    subCommands: [
+      {
+        name: 'html',
+        kind: CommandKind.BUILT_IN,
+        description: 'Export HTML',
+        action: vi.fn(),
+      },
+      {
+        name: 'md',
+        kind: CommandKind.BUILT_IN,
+        description: 'Export Markdown',
+        action: vi.fn(),
+      },
+      {
+        name: 'json',
+        kind: CommandKind.BUILT_IN,
+        description: 'Export JSON',
+        action: vi.fn(),
+      },
+      {
+        name: 'jsonl',
+        kind: CommandKind.BUILT_IN,
+        description: 'Export JSONL',
+        action: vi.fn(),
+      },
+    ],
+  },
 ];
 
 describe('InputPrompt', () => {
@@ -92,12 +162,56 @@ describe('InputPrompt', () => {
   const mockedUseShellHistory = vi.mocked(useShellHistory);
   const mockedUseCommandCompletion = vi.mocked(useCommandCompletion);
   const mockedUseInputHistory = vi.mocked(useInputHistory);
+  const mockedUseUIState = vi.mocked(useUIState);
+  const mockedUseUIActions = vi.mocked(useUIActions);
+  const mockedUseAgentViewState = vi.mocked(useAgentViewState);
+  const mockedUseAgentViewActions = vi.mocked(useAgentViewActions);
+  const mockedUseBackgroundTaskViewState = vi.mocked(
+    useBackgroundTaskViewState,
+  );
+  const mockedUseBackgroundTaskViewActions = vi.mocked(
+    useBackgroundTaskViewActions,
+  );
   const mockedUseReverseSearchCompletion = vi.mocked(
     useReverseSearchCompletion,
   );
 
   beforeEach(() => {
     vi.resetAllMocks();
+    mockViewActions.setAgentTabBarFocused.mockReset();
+    mockViewActions.setBgPillFocused.mockReset();
+
+    mockedUseUIState.mockReturnValue({
+      isFeedbackDialogOpen: false,
+      messageQueue: [],
+      pendingGeminiHistoryItems: [],
+    } as unknown as ReturnType<typeof useUIState>);
+    mockedUseUIActions.mockReturnValue({
+      handleRetryLastPrompt: vi.fn(),
+      temporaryCloseFeedbackDialog: vi.fn(),
+      popAllQueuedMessages: vi.fn(() => null),
+    } as unknown as ReturnType<typeof useUIActions>);
+    mockedUseAgentViewState.mockReturnValue({
+      activeView: 'main',
+      agents: new Map(),
+      agentShellFocused: false,
+      agentInputBufferText: '',
+      agentTabBarFocused: false,
+      agentApprovalModes: new Map(),
+    });
+    mockedUseAgentViewActions.mockReturnValue({
+      setAgentTabBarFocused: mockViewActions.setAgentTabBarFocused,
+    } as unknown as ReturnType<typeof useAgentViewActions>);
+    mockedUseBackgroundTaskViewState.mockReturnValue({
+      entries: [],
+      selectedIndex: 0,
+      dialogMode: 'closed',
+      dialogOpen: false,
+      pillFocused: false,
+    });
+    mockedUseBackgroundTaskViewActions.mockReturnValue({
+      setPillFocused: mockViewActions.setBgPillFocused,
+    } as unknown as ReturnType<typeof useBackgroundTaskViewActions>);
 
     mockCommandContext = createMockCommandContext();
 
@@ -112,6 +226,8 @@ describe('InputPrompt', () => {
         mockBuffer.viewportVisualLines = [newText];
         mockBuffer.allVisualLines = [newText];
         mockBuffer.visualToLogicalMap = [[0, 0]];
+        // Mirror real buffer: setText positions cursor at end of last visual line
+        mockBuffer.visualCursor = [0, newText.length];
       }),
       replaceRangeByOffset: vi.fn(),
       viewportVisualLines: [''],
@@ -156,6 +272,7 @@ describe('InputPrompt', () => {
       showSuggestions: false,
       visibleStartIndex: 0,
       isPerfectMatch: false,
+      midInputGhostText: null,
       navigateUp: vi.fn(),
       navigateDown: vi.fn(),
       resetCompletionState: vi.fn(),
@@ -169,6 +286,7 @@ describe('InputPrompt', () => {
       navigateUp: vi.fn(),
       navigateDown: vi.fn(),
       handleSubmit: vi.fn(),
+      resetHistoryNav: vi.fn(),
     };
     mockedUseInputHistory.mockReturnValue(mockInputHistory);
 
@@ -212,27 +330,44 @@ describe('InputPrompt', () => {
     };
   });
 
-  const wait = (ms = 50) => new Promise((resolve) => setTimeout(resolve, ms));
+  // Two microtask yields are intentional: Ink 7 + React 19 split a render
+  // pass across two ticks (one to flush state updates into the reconciler,
+  // a second for the resulting effects to settle). A single Promise.resolve
+  // drains only the first tick and produces flaky assertions on slow CI.
+  const flush = async () => {
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  };
+  // Ink 7 throttles render at 30fps (~33ms/frame). 50ms only covers 1.5
+  // frames, which races on slow CI runners (notably macOS 22.x). 150ms
+  // gives ~4-5 frames headroom for stdin.write -> reconcile -> render ->
+  // assert sequences without measurably slowing the suite.
+  const wait = (ms = 150) => new Promise((resolve) => setTimeout(resolve, ms));
+  const advanceTimers = async (ms: number) => {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+    await flush();
+  };
 
   describe('prompt suggestions', () => {
-    it('does not accept the prompt suggestion on shift+tab', async () => {
-      const { stdin, unmount } = renderWithProviders(
-        <InputPrompt {...props} promptSuggestion="commit this" />,
-      );
-      await wait(350);
-
-      stdin.write('\x1b[Z'); // shift+tab
-      await wait();
-
-      expect(mockBuffer.insert).not.toHaveBeenCalled();
-      unmount();
-    });
+    // createFollowupController.setSuggestion debounces the visibility
+    // transition by SUGGESTION_DELAY_MS (300ms) before flipping
+    // followup.state.isVisible to true. The Enter handler reads that flag
+    // synchronously, so we must wait for the timer to fire before pressing
+    // Enter — otherwise the suggestion path is skipped and onSubmit never
+    // runs. 350ms left only ~50ms margin and was eaten by ink 7 / React 19.2
+    // mount overhead on slow Windows CI runners. Keep this wait > 300ms +
+    // generous buffer (renderWithProviders cold start can be 100-200ms).
+    const SUGGESTION_VISIBLE_WAIT_MS = 700;
 
     it('accepts and submits the prompt suggestion on Enter when the buffer is empty', async () => {
       const { stdin, unmount } = renderWithProviders(
         <InputPrompt {...props} promptSuggestion="commit this" />,
       );
-      await wait(350);
+      await wait(SUGGESTION_VISIBLE_WAIT_MS);
 
       stdin.write('\r');
       await wait();
@@ -245,18 +380,24 @@ describe('InputPrompt', () => {
       unmount();
     });
 
-    it('fills the prompt suggestion on right arrow without submitting', async () => {
+    it('does not accept the prompt suggestion on shift+tab', async () => {
+      vi.useFakeTimers();
       const { stdin, unmount } = renderWithProviders(
         <InputPrompt {...props} promptSuggestion="commit this" />,
       );
-      await wait(350);
+      try {
+        await advanceTimers(SUGGESTION_VISIBLE_WAIT_MS);
 
-      stdin.write('\u001B[C'); // right arrow
-      await wait();
+        act(() => {
+          stdin.write('\x1b[Z'); // shift+tab
+        });
+        await flush();
 
-      expect(mockBuffer.insert).toHaveBeenCalledWith('commit this');
-      expect(props.onSubmit).not.toHaveBeenCalled();
-      unmount();
+        expect(mockBuffer.insert).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+        unmount();
+      }
     });
 
     it('does not accept a prompt suggestion while command completion is active', async () => {
@@ -269,16 +410,231 @@ describe('InputPrompt', () => {
         },
       ] as UseCommandCompletionReturn['suggestions'];
 
+      vi.useFakeTimers();
       const { stdin, unmount } = renderWithProviders(
         <InputPrompt {...props} promptSuggestion="commit this" />,
       );
-      await wait(350);
+      try {
+        await advanceTimers(SUGGESTION_VISIBLE_WAIT_MS);
 
-      stdin.write('\t');
+        act(() => {
+          stdin.write('\t');
+        });
+        await flush();
+
+        expect(mockBuffer.insert).not.toHaveBeenCalledWith('commit this');
+        expect(mockCommandCompletion.handleAutocomplete).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+        unmount();
+      }
+    });
+  });
+
+  // Regression for #4171: `onTabConsumerChange` (consumed by AppContainer
+  // as `shouldBlockTab`) must report `true` whenever ANY input-side handler
+  // would consume Tab — autocomplete dropdown, followup suggestion, or
+  // mid-input ghost text. Otherwise on Windows the bare-Tab approval-mode
+  // fallback double-fires alongside the input-side handler.
+  describe('onTabConsumerChange reporting (issue #4171)', () => {
+    // Match the SUGGESTION_DELAY_MS debounce inside createFollowupController.
+    const SUGGESTION_VISIBLE_WAIT_MS = 700;
+
+    it('reports true while the followup prompt suggestion is visible', async () => {
+      const onTabConsumerChange = vi.fn();
+      const { unmount } = renderWithProviders(
+        <InputPrompt
+          {...props}
+          promptSuggestion="commit this"
+          onTabConsumerChange={onTabConsumerChange}
+        />,
+      );
+      await wait(SUGGESTION_VISIBLE_WAIT_MS);
+
+      expect(onTabConsumerChange).toHaveBeenCalledWith(true);
+      unmount();
+    });
+
+    it('reports true while mid-input ghost text offers an accept', async () => {
+      mockCommandCompletion.midInputGhostText = {
+        text: 'ile.txt',
+        insertPosition: 1,
+        acceptText: 'ile.txt',
+      };
+      const onTabConsumerChange = vi.fn();
+      const { unmount } = renderWithProviders(
+        <InputPrompt {...props} onTabConsumerChange={onTabConsumerChange} />,
+      );
       await wait();
 
-      expect(mockBuffer.insert).not.toHaveBeenCalledWith('commit this');
-      expect(mockCommandCompletion.handleAutocomplete).toHaveBeenCalled();
+      expect(onTabConsumerChange).toHaveBeenCalledWith(true);
+      unmount();
+    });
+
+    it('reports true while the autocomplete dropdown is visible', async () => {
+      mockCommandCompletion.showSuggestions = true;
+      mockCommandCompletion.suggestions = [
+        {
+          value: '/clear',
+          label: '/clear',
+          description: 'Clear screen',
+        },
+      ] as UseCommandCompletionReturn['suggestions'];
+      const onTabConsumerChange = vi.fn();
+      const { unmount } = renderWithProviders(
+        <InputPrompt {...props} onTabConsumerChange={onTabConsumerChange} />,
+      );
+      await wait();
+
+      expect(onTabConsumerChange).toHaveBeenCalledWith(true);
+      unmount();
+    });
+
+    it('reports false when the input area is idle (no dropdown, no followup, no ghost)', async () => {
+      const onTabConsumerChange = vi.fn();
+      const { unmount } = renderWithProviders(
+        <InputPrompt {...props} onTabConsumerChange={onTabConsumerChange} />,
+      );
+      await wait();
+
+      // Pin the actual value (not just "never true") — the mount-time effect
+      // must report false when nothing in the input area wants Tab.
+      expect(onTabConsumerChange).toHaveBeenCalledWith(false);
+      expect(onTabConsumerChange).not.toHaveBeenCalledWith(true);
+      unmount();
+    });
+
+    it('reports false again after the autocomplete dropdown is dismissed', async () => {
+      mockedUseCommandCompletion.mockReturnValue({
+        ...mockCommandCompletion,
+        showSuggestions: true,
+        suggestions: [
+          {
+            value: '/clear',
+            label: '/clear',
+            description: 'Clear screen',
+          },
+        ] as UseCommandCompletionReturn['suggestions'],
+      });
+      const onTabConsumerChange = vi.fn();
+      const { rerender, unmount } = renderWithProviders(
+        <InputPrompt {...props} onTabConsumerChange={onTabConsumerChange} />,
+      );
+      await wait();
+      expect(onTabConsumerChange).toHaveBeenLastCalledWith(true);
+
+      // Dismiss the dropdown and re-render — Windows Tab cycling must be
+      // re-enabled. Without this transition signal, the parent would keep
+      // suppressing the approval-mode fallback after the dropdown closed.
+      mockedUseCommandCompletion.mockReturnValue(mockCommandCompletion);
+      rerender(
+        <InputPrompt {...props} onTabConsumerChange={onTabConsumerChange} />,
+      );
+      await wait();
+
+      expect(onTabConsumerChange).toHaveBeenLastCalledWith(false);
+      unmount();
+    });
+
+    it('reports false on unmount even if a Tab consumer was active', async () => {
+      // Regression for the stale-signal bug: if InputPrompt unmounts while
+      // some Tab consumer is true (e.g. streaming starts while autocomplete
+      // is open), AppContainer would otherwise keep blocking Windows Tab
+      // approval-mode cycling for the entire streaming window.
+      mockedUseCommandCompletion.mockReturnValue({
+        ...mockCommandCompletion,
+        showSuggestions: true,
+        suggestions: [
+          {
+            value: '/clear',
+            label: '/clear',
+            description: 'Clear screen',
+          },
+        ] as UseCommandCompletionReturn['suggestions'],
+      });
+      const onTabConsumerChange = vi.fn();
+      const { unmount } = renderWithProviders(
+        <InputPrompt {...props} onTabConsumerChange={onTabConsumerChange} />,
+      );
+      await wait();
+      expect(onTabConsumerChange).toHaveBeenLastCalledWith(true);
+
+      unmount();
+      // Last call after unmount must be false — the cleanup function fires.
+      expect(onTabConsumerChange).toHaveBeenLastCalledWith(false);
+    });
+  });
+
+  // Regression for #4308 review: `onSuggestionsVisibilityChange` must stay
+  // narrow (autocomplete dropdown only). Composer uses this signal to hide
+  // the Footer / KeyboardShortcuts when the dropdown competes for vertical
+  // space. Followup suggestions and mid-input ghost text are inline within
+  // the input box and must NOT hide the Footer — broadening this signal
+  // would cause Footer churn on all platforms.
+  describe('onSuggestionsVisibilityChange stays narrow (autocomplete only)', () => {
+    const SUGGESTION_VISIBLE_WAIT_MS = 700;
+
+    it('stays false when only a followup prompt suggestion is visible', async () => {
+      const onSuggestionsVisibilityChange = vi.fn();
+      const onTabConsumerChange = vi.fn();
+      const { unmount } = renderWithProviders(
+        <InputPrompt
+          {...props}
+          promptSuggestion="commit this"
+          onSuggestionsVisibilityChange={onSuggestionsVisibilityChange}
+          onTabConsumerChange={onTabConsumerChange}
+        />,
+      );
+      await wait(SUGGESTION_VISIBLE_WAIT_MS);
+
+      // Tab consumer signal flips true (followup is a Tab consumer)…
+      expect(onTabConsumerChange).toHaveBeenCalledWith(true);
+      // …but the narrow signal must NOT — Footer should stay visible.
+      expect(onSuggestionsVisibilityChange).not.toHaveBeenCalledWith(true);
+      unmount();
+    });
+
+    it('stays false when only mid-input ghost text is present', async () => {
+      mockCommandCompletion.midInputGhostText = {
+        text: 'ile.txt',
+        insertPosition: 1,
+        acceptText: 'ile.txt',
+      };
+      const onSuggestionsVisibilityChange = vi.fn();
+      const onTabConsumerChange = vi.fn();
+      const { unmount } = renderWithProviders(
+        <InputPrompt
+          {...props}
+          onSuggestionsVisibilityChange={onSuggestionsVisibilityChange}
+          onTabConsumerChange={onTabConsumerChange}
+        />,
+      );
+      await wait();
+
+      expect(onTabConsumerChange).toHaveBeenCalledWith(true);
+      expect(onSuggestionsVisibilityChange).not.toHaveBeenCalledWith(true);
+      unmount();
+    });
+
+    it('flips true only when the autocomplete dropdown is visible', async () => {
+      mockCommandCompletion.showSuggestions = true;
+      mockCommandCompletion.suggestions = [
+        {
+          value: '/clear',
+          label: '/clear',
+          description: 'Clear screen',
+        },
+      ] as UseCommandCompletionReturn['suggestions'];
+      const onSuggestionsVisibilityChange = vi.fn();
+      const { unmount } = renderWithProviders(
+        <InputPrompt
+          {...props}
+          onSuggestionsVisibilityChange={onSuggestionsVisibilityChange}
+        />,
+      );
+      await wait();
+
+      expect(onSuggestionsVisibilityChange).toHaveBeenCalledWith(true);
       unmount();
     });
   });
@@ -286,10 +642,10 @@ describe('InputPrompt', () => {
   it('should call shellHistory.getPreviousCommand on up arrow in shell mode', async () => {
     props.shellModeActive = true;
     const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
-    await wait();
 
-    stdin.write('\u001B[A');
-    await wait();
+    act(() => {
+      stdin.write('\u001B[A');
+    });
 
     expect(mockShellHistory.getPreviousCommand).toHaveBeenCalled();
     unmount();
@@ -298,10 +654,10 @@ describe('InputPrompt', () => {
   it('should call shellHistory.getNextCommand on down arrow in shell mode', async () => {
     props.shellModeActive = true;
     const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
-    await wait();
 
-    stdin.write('\u001B[B');
-    await wait();
+    act(() => {
+      stdin.write('\u001B[B');
+    });
 
     expect(mockShellHistory.getNextCommand).toHaveBeenCalled();
     unmount();
@@ -342,8 +698,12 @@ describe('InputPrompt', () => {
     const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
     await wait();
 
+    // Two-step edge: pre-position cursor at col 0 so Up directly triggers history
+    mockBuffer.visualCursor = [0, 0];
     stdin.write('\u001B[A'); // Up arrow
     await wait();
+    // Pre-position cursor at end so Down directly triggers history
+    mockBuffer.visualCursor = [0, 'some text'.length];
     stdin.write('\u001B[B'); // Down arrow
     await wait();
     stdin.write('\r'); // Enter
@@ -381,6 +741,8 @@ describe('InputPrompt', () => {
     expect(mockCommandCompletion.navigateDown).not.toHaveBeenCalled();
 
     // Ctrl+P should navigate history, not completion
+    // Two-step edge: pre-position cursor at col 0 so Ctrl+P directly triggers history
+    mockBuffer.visualCursor = [0, 0];
     stdin.write('\u0010'); // Ctrl+P
     await wait();
     expect(mockCommandCompletion.navigateUp).toHaveBeenCalledTimes(1);
@@ -410,6 +772,8 @@ describe('InputPrompt', () => {
     expect(mockCommandCompletion.navigateUp).not.toHaveBeenCalled();
 
     // Ctrl+N should navigate history, not completion
+    // Two-step edge: pre-position cursor at end so Ctrl+N directly triggers history
+    mockBuffer.visualCursor = [0, '/mem'.length];
     stdin.write('\u000E'); // Ctrl+N
     await wait();
     expect(mockCommandCompletion.navigateDown).toHaveBeenCalledTimes(1);
@@ -630,18 +994,18 @@ describe('InputPrompt', () => {
   });
 
   it('should handle the "backspace" edge case correctly', async () => {
-    // SCENARIO: /memory -> Backspace -> /memory -> Tab (to accept 'show')
+    // SCENARIO: /config -> Backspace -> /config -> Tab (to accept 'set')
     mockedUseCommandCompletion.mockReturnValue({
       ...mockCommandCompletion,
       showSuggestions: true,
       suggestions: [
-        { label: 'show', value: 'show' },
-        { label: 'add', value: 'add' },
+        { label: 'set', value: 'set' },
+        { label: 'reset', value: 'reset' },
       ],
-      activeSuggestionIndex: 0, // 'show' is highlighted
+      activeSuggestionIndex: 0, // 'set' is highlighted
     });
-    // The user has backspaced, so the query is now just '/memory'
-    props.buffer.setText('/memory');
+    // The user has backspaced, so the query is now just '/config'
+    props.buffer.setText('/config');
 
     const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
     await wait();
@@ -649,20 +1013,20 @@ describe('InputPrompt', () => {
     stdin.write('\t'); // Press Tab
     await wait();
 
-    // It should NOT become '/show'. It should correctly become '/memory show'.
+    // It should NOT become '/set'. It should correctly become '/config set'.
     expect(mockCommandCompletion.handleAutocomplete).toHaveBeenCalledWith(0);
     unmount();
   });
 
   it('should complete a partial argument for a command', async () => {
-    // SCENARIO: /memory add fi- -> Tab
+    // SCENARIO: /config set fi- -> Tab
     mockedUseCommandCompletion.mockReturnValue({
       ...mockCommandCompletion,
       showSuggestions: true,
       suggestions: [{ label: 'fix-foo', value: 'fix-foo' }],
       activeSuggestionIndex: 0,
     });
-    props.buffer.setText('/memory add fi-');
+    props.buffer.setText('/config set fi-');
 
     const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
     await wait();
@@ -752,6 +1116,771 @@ describe('InputPrompt', () => {
     await wait();
 
     expect(props.onSubmit).toHaveBeenCalledWith('/clear');
+    unmount();
+  });
+
+  it('should submit a perfect match on Enter when suggestions were not navigated', async () => {
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/export');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    stdin.write('\r');
+    await wait();
+
+    expect(props.onSubmit).toHaveBeenCalledWith('/export');
+    expect(mockCommandCompletion.handleAutocomplete).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it('should fill and submit an export format selected with arrow navigation', async () => {
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/export');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    stdin.write('\u001B[B');
+    await wait();
+
+    expect(props.buffer.setText).toHaveBeenLastCalledWith('/export md');
+    expect(mockCommandCompletion.handleAutocomplete).not.toHaveBeenCalled();
+    expect(props.onSubmit).not.toHaveBeenCalled();
+
+    stdin.write('\r');
+    await wait();
+
+    expect(props.onSubmit).toHaveBeenCalledWith('/export md');
+    unmount();
+  });
+
+  it('should keep cycling export formats after arrow navigation fills input', async () => {
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/export');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    stdin.write('\u001B[B');
+    await wait();
+    stdin.write('\u001B[B');
+    await wait();
+
+    expect(props.buffer.setText).toHaveBeenNthCalledWith(2, '/export md');
+    expect(props.buffer.setText).toHaveBeenNthCalledWith(3, '/export json');
+    expect(mockInputHistory.navigateDown).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it('should keep export format suggestions visible after arrow navigation fills input', async () => {
+    const exportSuggestions = [
+      { label: 'html', value: 'html' },
+      { label: 'md', value: 'md' },
+      { label: 'json', value: 'json' },
+      { label: 'jsonl', value: 'jsonl' },
+    ];
+    mockedUseCommandCompletion.mockImplementation((buffer) => {
+      const isExportRoot = buffer.text.trim() === '/export';
+      return {
+        ...mockCommandCompletion,
+        showSuggestions: isExportRoot,
+        suggestions: isExportRoot ? exportSuggestions : [],
+        activeSuggestionIndex: 0,
+        isPerfectMatch: isExportRoot,
+      };
+    });
+    const TestHarness = () => {
+      const buffer = useTextBuffer({
+        initialText: '/export',
+        viewport: { width: 80, height: 20 },
+        isValidPath: () => false,
+        onChange: () => {},
+      });
+      return <InputPrompt {...props} buffer={buffer} />;
+    };
+
+    const { stdin, lastFrame, unmount } = renderWithProviders(<TestHarness />);
+    await wait();
+
+    stdin.write('\u001B[B');
+    await wait();
+
+    const output = stripAnsi(lastFrame() ?? '');
+    expect(output).toContain('/export md');
+    expect(output).toContain('html');
+    expect(output).toContain('md');
+    expect(output).toContain('json');
+    expect(output).toContain('jsonl');
+    expect(output).toContain('Export Markdown');
+    unmount();
+  });
+
+  it('should not clobber manually edited buffer when arrow is pressed after export fill', async () => {
+    // Regression for PR #3701 review: exportCompletionSelectionIndexRef
+    // leaked across buffer edits, so arrow keys would overwrite user-typed
+    // text after the user moved away from an "/export <fmt>" input.
+    mockedUseCommandCompletion.mockImplementation((buffer) => {
+      const isExportRoot = buffer.text.trim() === '/export';
+      return {
+        ...mockCommandCompletion,
+        showSuggestions: isExportRoot,
+        suggestions: isExportRoot
+          ? [
+              { label: 'html', value: 'html' },
+              { label: 'md', value: 'md' },
+              { label: 'json', value: 'json' },
+              { label: 'jsonl', value: 'jsonl' },
+            ]
+          : [],
+        activeSuggestionIndex: 0,
+        isPerfectMatch: isExportRoot,
+      };
+    });
+
+    const TestHarness = () => {
+      const buffer = useTextBuffer({
+        initialText: '/export',
+        viewport: { width: 80, height: 20 },
+        isValidPath: () => false,
+        onChange: () => {},
+      });
+      return <InputPrompt {...props} buffer={buffer} />;
+    };
+
+    const { stdin, lastFrame, unmount } = renderWithProviders(<TestHarness />);
+    await wait();
+
+    // Phase 1 + 2: Down fills "/export md".
+    stdin.write('\u001B[B');
+    await wait();
+    expect(stripAnsi(lastFrame() ?? '')).toContain('/export md');
+
+    // User clears buffer and types a different command manually.
+    stdin.write('\u0015'); // Ctrl+U: clear line
+    await wait();
+    // Pin the intermediate state: Ctrl+U must actually clear the buffer
+    // before we type the new command, so a future useTextBuffer/hook change
+    // can't make this test pass for the wrong reason.
+    expect(stripAnsi(lastFrame() ?? '')).not.toContain('/export');
+    stdin.write('/help');
+    await wait();
+    const afterEditFrame = stripAnsi(lastFrame() ?? '');
+    expect(afterEditFrame).toContain('/help');
+
+    // Pressing Down now must NOT overwrite "/help" with an export format.
+    stdin.write('\u001B[B');
+    await wait();
+    const afterArrowFrame = stripAnsi(lastFrame() ?? '');
+    expect(afterArrowFrame).toContain('/help');
+    expect(afterArrowFrame).not.toMatch(/\/export\s+(html|md|json|jsonl)/);
+    unmount();
+  });
+
+  it('should wrap to jsonl when pressing Up from the /export Phase 1 popup', async () => {
+    // Regression for PR #3701 second-round review: Phase 1 Up-arrow path
+    // (including 0 -> lastIndex wrap) had no test coverage.
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/export');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    stdin.write('\u001B[A');
+    await wait();
+
+    expect(props.buffer.setText).toHaveBeenLastCalledWith('/export jsonl');
+    expect(mockCommandCompletion.handleAutocomplete).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it('should wrap Phase 2 cycling backward when pressing Up repeatedly', async () => {
+    // Regression for PR #3701 second-round review: Phase 2 Up-arrow wrap
+    // logic had no test coverage (existing tests only used Down).
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/export');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    // Phase 1 Down -> /export md (ref=1).
+    stdin.write('\u001B[B');
+    await wait();
+    // Phase 2 Up -> /export html (ref=0).
+    stdin.write('\u001B[A');
+    await wait();
+    // Phase 2 Up wraps from index 0 to last index -> /export jsonl (ref=3).
+    stdin.write('\u001B[A');
+    await wait();
+
+    expect(props.buffer.setText).toHaveBeenNthCalledWith(2, '/export md');
+    expect(props.buffer.setText).toHaveBeenNthCalledWith(3, '/export html');
+    expect(props.buffer.setText).toHaveBeenNthCalledWith(4, '/export jsonl');
+    unmount();
+  });
+
+  it('should seed Phase 2 cycling when Tab accepts a format in the /export popup', async () => {
+    // Regression for PR #3701 second-round review (Suggestion): Tab in the
+    // Phase 1 popup must run the export-specific path so that
+    // exportCompletionSelectionIndexRef is seeded and subsequent arrow/Tab
+    // keys can continue cycling.
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/export');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    // Tab in Phase 1 popup fills /export html and seeds the ref.
+    stdin.write('\t');
+    await wait();
+    expect(props.buffer.setText).toHaveBeenLastCalledWith('/export html');
+    expect(mockCommandCompletion.handleAutocomplete).not.toHaveBeenCalled();
+
+    // Phase 2 Down now cycles forward from the seeded ref.
+    stdin.write('\u001B[B');
+    await wait();
+    expect(props.buffer.setText).toHaveBeenLastCalledWith('/export md');
+
+    // Phase 2 Tab should also cycle (covers isCompletionTabKey branch).
+    stdin.write('\t');
+    await wait();
+    expect(props.buffer.setText).toHaveBeenLastCalledWith('/export json');
+    unmount();
+  });
+
+  it('should not overwrite /export html with extra args when Down is pressed', async () => {
+    // Regression for PR #3701 second-round review (Critical): Phase 2 cycling
+    // guard used startsWith('/export '), which matched inputs like
+    // '/export html --verbose' and silently wiped out the extra arguments.
+    // The strict getExportFormatFromInput guard must let such inputs fall
+    // through without overwriting the buffer.
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/export');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    // Seed Phase 2 state: Down fills /export md and sets ref=1.
+    stdin.write('\u001B[B');
+    await wait();
+    expect(props.buffer.setText).toHaveBeenLastCalledWith('/export md');
+
+    // Simulate the user appending extra arguments to the export input.
+    props.buffer.setText('/export md --verbose');
+    (props.buffer.setText as ReturnType<typeof vi.fn>).mockClear();
+
+    // Pressing Down must NOT replace the buffer with '/export json'.
+    stdin.write('\u001B[B');
+    await wait();
+    expect(props.buffer.setText).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it('should reset export cycling state on Escape so arrows no longer cycle', async () => {
+    // Regression for PR #3701 third-round review (Suggestion): ESC resets
+    // exportCompletionSelectionIndexRef but this path had no test coverage,
+    // so a regression could silently break the reset.
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/export');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    // Phase 1 Down -> /export md (enters Phase 2).
+    stdin.write('\u001B[B');
+    await wait();
+    expect(props.buffer.setText).toHaveBeenLastCalledWith('/export md');
+    (props.buffer.setText as ReturnType<typeof vi.fn>).mockClear();
+
+    // Press Escape — should reset the cycling state.
+    stdin.write('\x1B');
+    await wait();
+
+    // Subsequent Down must NOT overwrite the buffer with an export format.
+    stdin.write('\u001B[B');
+    await wait();
+    expect(props.buffer.setText).not.toHaveBeenCalledWith('/export json');
+    expect(props.buffer.setText).not.toHaveBeenCalledWith('/export html');
+    expect(props.buffer.setText).not.toHaveBeenCalledWith('/export jsonl');
+    expect(props.buffer.setText).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it('should reset export cycling state on Ctrl+C so new input is not overwritten', async () => {
+    // Regression for PR #3701 third-round review (Suggestion): Ctrl+C resets
+    // exportCompletionSelectionIndexRef but this path had no test coverage,
+    // so the ref could leak into the new input. Verify that after Ctrl+C
+    // the user can type a completely unrelated command without arrow keys
+    // clobbering it with export formats.
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/export');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    // Phase 1 Down -> /export md (enters Phase 2).
+    stdin.write('\u001B[B');
+    await wait();
+    expect(props.buffer.setText).toHaveBeenLastCalledWith('/export md');
+    (props.buffer.setText as ReturnType<typeof vi.fn>).mockClear();
+
+    // Ctrl+C clears the buffer.
+    stdin.write('\x03');
+    await wait();
+
+    // Set a completely different command into the buffer.
+    props.buffer.setText('/help');
+    (props.buffer.setText as ReturnType<typeof vi.fn>).mockClear();
+
+    // Pressing Down must NOT overwrite '/help' with an export format.
+    stdin.write('\u001B[B');
+    await wait();
+    expect(props.buffer.setText).not.toHaveBeenCalledWith('/export json');
+    expect(props.buffer.setText).not.toHaveBeenCalledWith('/export html');
+    expect(props.buffer.setText).not.toHaveBeenCalledWith('/export jsonl');
+    expect(props.buffer.setText).not.toHaveBeenCalledWith('/export md');
+    expect(props.buffer.setText).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it('should cycle export format on Down when /export <fmt> was typed manually (not via popup)', async () => {
+    // Regression for PR #3701 fifth-round review: users who type
+    // "/export md" directly (without going through the Phase-1 popup)
+    // must still get Phase-2 cycling on arrow keys, but programmatic
+    // buffer.setText/history restores must not arm the same state.
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: false, // popup is closed for direct input
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: false,
+    });
+
+    const TestHarness = () => {
+      const buffer = useTextBuffer({
+        initialText: '',
+        viewport: { width: 80, height: 20 },
+        isValidPath: () => false,
+        onChange: () => {},
+      });
+      return <InputPrompt {...props} buffer={buffer} />;
+    };
+
+    const { stdin, lastFrame, unmount } = renderWithProviders(<TestHarness />);
+    await wait();
+
+    act(() => {
+      stdin.write('/export md');
+    });
+    await wait(350);
+    expect(stripAnsi(lastFrame() ?? '')).toContain('/export md');
+
+    // Pressing Down must cycle to the NEXT format (json).
+    act(() => {
+      stdin.write('\u001B[B');
+    });
+    expect(stripAnsi(lastFrame() ?? '')).toContain('/export json');
+    unmount();
+  });
+
+  it('should not arm export cycling from restored history text', async () => {
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: false,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: false,
+    });
+
+    const TestHarness = () => {
+      const buffer = useTextBuffer({
+        initialText: '/export md',
+        // Two-step edge: position cursor at end so Down directly triggers history
+        initialCursorOffset: '/export md'.length,
+        viewport: { width: 80, height: 20 },
+        isValidPath: () => false,
+        onChange: () => {},
+      });
+      return <InputPrompt {...props} buffer={buffer} />;
+    };
+
+    const { stdin, lastFrame, unmount } = renderWithProviders(<TestHarness />);
+    await wait();
+
+    stdin.write('\u001B[B');
+    await wait();
+
+    expect(mockInputHistory.navigateDown).toHaveBeenCalled();
+    expect(stripAnsi(lastFrame() ?? '')).toContain('/export md');
+    expect(stripAnsi(lastFrame() ?? '')).not.toContain('/export json');
+    unmount();
+  });
+
+  it('should trigger export-specific arrow navigation even when completion suggestions are a superset', async () => {
+    // Regression for PR #3701 review (hasExportFormatSuggestions superset
+    // matching): when extra non-export items appear alongside all export
+    // formats, Phase 1 must still route arrow keys to setExportCompletionInput
+    // instead of silently falling through to generic navigateDown.
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+        { label: 'report', value: 'report' }, // extra suggestion
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/export');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    stdin.write('\u001B[B'); // Down
+    await wait();
+
+    expect(props.buffer.setText).toHaveBeenLastCalledWith('/export md');
+    expect(mockCommandCompletion.navigateDown).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it('should fall through to generic accept when Tab targets a non-export item in the /export superset popup', async () => {
+    // Regression for PR #3701 review: when the active suggestion in the
+    // Phase 1 superset popup is a non-export item, ACCEPT_SUGGESTION must
+    // NOT call setExportCompletionInput — it must fall through to the
+    // generic acceptActiveCompletionSuggestion.
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+        { label: 'report', value: 'report' },
+      ],
+      activeSuggestionIndex: 4, // the non-export item
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/export');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    stdin.write('\t'); // Tab (ACCEPT_SUGGESTION)
+    await wait();
+
+    expect(mockCommandCompletion.handleAutocomplete).toHaveBeenCalledWith(4);
+    // Must NOT write "/export report" to the buffer.
+    expect(props.buffer.setText).not.toHaveBeenCalledWith('/export report');
+    unmount();
+  });
+
+  it('should fall through to generic completion when suggestions are missing an export format', async () => {
+    // Regression for PR #3701 review: when completion suggestions do NOT
+    // include all export formats, hasExportFormatSuggestions must be false
+    // and arrow keys must go through the generic completion.navigateDown
+    // path instead of setExportCompletionInput.
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        // jsonl intentionally missing
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/export');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    stdin.write('\u001B[B'); // Down
+    await wait();
+
+    expect(mockCommandCompletion.navigateDown).toHaveBeenCalled();
+    expect(props.buffer.setText).not.toHaveBeenCalledWith('/export md');
+    expect(props.buffer.setText).not.toHaveBeenCalledWith('/export json');
+    unmount();
+  });
+
+  it('should trigger Phase 1 export popup even when /export has trailing spaces', async () => {
+    // Regression: trailing whitespace after "/export" must be treated the
+    // same as plain "/export" — trim() should normalise the buffer so
+    // hasExportFormatSuggestions activates and the popup triggers.
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/export  '); // trailing spaces
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    stdin.write('\u001B[B'); // Down
+    await wait();
+
+    expect(props.buffer.setText).toHaveBeenLastCalledWith('/export md');
+    expect(mockCommandCompletion.navigateDown).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it('should autocomplete on Enter when user arrow-navigated a perfect-match suggestion list', async () => {
+    // Regression for PR #3701 review: the isPerfectMatch + navigated + Enter
+    // branch was not covered by tests.
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'show', value: 'show' },
+        { label: 'add', value: 'add' },
+        { label: 'refresh', value: 'refresh' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/memory');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    // Arrow-navigate so completionSelectionWasNavigatedRef flips to true.
+    stdin.write('\u001B[B');
+    await wait();
+    expect(mockCommandCompletion.navigateDown).toHaveBeenCalled();
+
+    // Enter should autocomplete the active suggestion, NOT submit the raw buffer.
+    stdin.write('\r');
+    await wait();
+
+    expect(mockCommandCompletion.handleAutocomplete).toHaveBeenCalledWith(0);
+    expect(props.onSubmit).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it('should submit directly on Enter after arrow-navigate + backspace + retype to perfect match', async () => {
+    // Regression for PR #3701 review (issue #5): navigate → backspace
+    // → retype → Enter must submit the raw buffer, not autocomplete.
+    // If the popup persists across backspace+retype and the navigated flag
+    // is not cleared on buffer.text changes, Enter would autocomplete the
+    // first sub-command instead of submitting the perfect match.
+    mockedUseCommandCompletion.mockImplementation((buf) => {
+      const text = buf.text;
+      const isMemory = text === '/memory';
+      return {
+        ...mockCommandCompletion,
+        showSuggestions: true, // popup stays visible throughout
+        suggestions: [
+          { label: 'show', value: 'show' },
+          { label: 'add', value: 'add' },
+          { label: 'refresh', value: 'refresh' },
+        ],
+        activeSuggestionIndex: 0,
+        isPerfectMatch: isMemory,
+      };
+    });
+    props.buffer.setText('/memory');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    // Arrow-navigate so completionSelectionWasNavigatedRef flips to true.
+    stdin.write('\u001B[B');
+    await wait();
+    expect(mockCommandCompletion.navigateDown).toHaveBeenCalled();
+
+    // Simulate backspace to /memor — popup stays visible in this test.
+    // Use unmount + re-render to force useEffect re-evaluation on the
+    // changed buffer.text (direct setText on the mock object doesn't
+    // trigger React state updates, so effects don't fire).
+    props.buffer.setText('/memor');
+    unmount();
+    const { unmount: unmountAfterEdit } = renderWithProviders(
+      <InputPrompt {...props} />,
+    );
+    await wait();
+
+    // Retype: /memor → /memory.
+    props.buffer.setText('/memory');
+    unmountAfterEdit();
+    const { stdin: stdinFinal, unmount: unmountFinal } = renderWithProviders(
+      <InputPrompt {...props} />,
+    );
+    await wait();
+
+    // Enter must submit '/memory', NOT autocomplete 'show'.
+    stdinFinal.write('\r');
+    await wait();
+
+    expect(props.onSubmit).toHaveBeenCalledWith('/memory');
+    expect(mockCommandCompletion.handleAutocomplete).not.toHaveBeenCalled();
+    unmountFinal();
+  });
+
+  it('should submit directly on Enter for a perfect match without prior arrow navigation', async () => {
+    // Control: with no arrow navigation, Enter on a perfect match must submit.
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: true,
+      suggestions: [
+        { label: 'show', value: 'show' },
+        { label: 'add', value: 'add' },
+      ],
+      activeSuggestionIndex: 0,
+      isPerfectMatch: true,
+    });
+    props.buffer.setText('/memory');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    stdin.write('\r');
+    await wait();
+
+    expect(props.onSubmit).toHaveBeenCalledWith('/memory');
+    expect(mockCommandCompletion.handleAutocomplete).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it('should reset history navigation after submitting on Enter', async () => {
+    mockedUseCommandCompletion.mockReturnValue({
+      ...mockCommandCompletion,
+      showSuggestions: false,
+      isPerfectMatch: false,
+    });
+    props.buffer.setText('a prompt from history');
+
+    const { stdin, unmount } = renderWithProviders(<InputPrompt {...props} />);
+    await wait();
+
+    stdin.write('\r');
+    await wait();
+
+    expect(props.onSubmit).toHaveBeenCalledWith('a prompt from history');
+    expect(mockInputHistory.resetHistoryNav).toHaveBeenCalled();
     unmount();
   });
 
@@ -863,6 +1992,7 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
@@ -891,6 +2021,7 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
@@ -919,14 +2050,15 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
     });
 
     it('should NOT trigger completion when cursor is after space following /', async () => {
-      mockBuffer.text = '/memory add';
-      mockBuffer.lines = ['/memory add'];
+      mockBuffer.text = '/config set';
+      mockBuffer.lines = ['/config set'];
       mockBuffer.cursor = [0, 11];
 
       mockedUseCommandCompletion.mockReturnValue({
@@ -947,6 +2079,7 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
@@ -975,6 +2108,7 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
@@ -1004,6 +2138,7 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
@@ -1032,6 +2167,7 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
@@ -1061,6 +2197,7 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
@@ -1090,6 +2227,7 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
@@ -1119,6 +2257,7 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
@@ -1148,6 +2287,7 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
@@ -1179,6 +2319,7 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
@@ -1208,6 +2349,7 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
@@ -1239,6 +2381,7 @@ describe('InputPrompt', () => {
         expect.any(Object),
         // active parameter: completion enabled when not just navigated history
         true,
+        undefined,
       );
 
       unmount();
@@ -1246,8 +2389,7 @@ describe('InputPrompt', () => {
   });
 
   describe('vim mode', () => {
-    it('should not call buffer.handleInput when vim mode is enabled and vim handles the input', async () => {
-      props.vimModeEnabled = true;
+    it('should not call buffer.handleInput when vim handles the input', async () => {
       props.vimHandleInput = vi.fn().mockReturnValue(true); // Mock that vim handled it.
       const { stdin, unmount } = renderWithProviders(
         <InputPrompt {...props} />,
@@ -1262,8 +2404,7 @@ describe('InputPrompt', () => {
       unmount();
     });
 
-    it('should call buffer.handleInput when vim mode is enabled but vim does not handle the input', async () => {
-      props.vimModeEnabled = true;
+    it('should call buffer.handleInput when vim does not handle the input', async () => {
       props.vimHandleInput = vi.fn().mockReturnValue(false); // Mock that vim did NOT handle it.
       const { stdin, unmount } = renderWithProviders(
         <InputPrompt {...props} />,
@@ -1675,21 +2816,29 @@ describe('InputPrompt', () => {
       );
       await wait();
 
-      // Simulate a paste operation (this sets the protection)
-      stdin.write(`\x1b[200~\npasted\x1b[201~`);
-      await wait();
+      vi.useFakeTimers();
+      try {
+        // Simulate a paste operation (this sets the protection)
+        act(() => {
+          stdin.write(`\x1b[200~\npasted\x1b[201~`);
+        });
+        await flush();
 
-      // Wait for the protection timeout to naturally expire
-      await new Promise((resolve) => setTimeout(resolve, 600));
+        // Advance the protection timer without sleeping in real time.
+        await advanceTimers(500);
 
-      // Now Enter should work normally
-      stdin.write('\r');
-      await wait();
+        // Now Enter should work normally
+        act(() => {
+          stdin.write('\r');
+        });
+        await flush();
 
-      // Verify that onSubmit was called after the timeout
-      expect(props.onSubmit).toHaveBeenCalledWith('test command');
-
-      unmount();
+        // Verify that onSubmit was called after the timeout
+        expect(props.onSubmit).toHaveBeenCalledWith('test command');
+      } finally {
+        vi.useRealTimers();
+        unmount();
+      }
     });
 
     it('should not interfere with normal Enter key submission when no recent paste', async () => {
@@ -1723,10 +2872,16 @@ describe('InputPrompt', () => {
       );
       await wait();
 
-      stdin.write('\x1B');
-      await wait();
+      act(() => {
+        stdin.write('\x1B');
+      });
+      // Double-ESC behavior is time-windowed; keep the second press inside
+      // the real 500ms reset window instead of draining only React updates.
+      await wait(50);
 
-      stdin.write('\x1B');
+      act(() => {
+        stdin.write('\x1B');
+      });
       await wait();
 
       expect(props.buffer.setText).toHaveBeenCalledWith('');
@@ -1991,6 +3146,37 @@ describe('InputPrompt', () => {
 
       unmount();
     });
+
+    it('does not fall through to shell history on Ctrl+P/N while reverse search is active', async () => {
+      const getPreviousCommand = vi.fn();
+      const getNextCommand = vi.fn();
+      vi.mocked(useShellHistory).mockReturnValue({
+        history: ['echo hello', 'echo world', 'ls'],
+        getPreviousCommand,
+        getNextCommand,
+        addCommandToHistory: vi.fn(),
+        resetHistoryPosition: vi.fn(),
+      });
+
+      const { stdin, stdout, unmount } = renderWithProviders(
+        <InputPrompt {...props} />,
+      );
+      await wait();
+
+      stdin.write('\x12'); // Ctrl+R
+      await wait();
+      expect(stdout.lastFrame()).toContain('(r:)');
+
+      stdin.write('\u0010'); // Ctrl+P
+      await wait();
+      stdin.write('\u000E'); // Ctrl+N
+      await wait();
+
+      expect(getPreviousCommand).not.toHaveBeenCalled();
+      expect(getNextCommand).not.toHaveBeenCalled();
+      expect(stdout.lastFrame()).toContain('(r:)');
+      unmount();
+    });
   });
 
   describe('Ctrl+E keyboard shortcut', () => {
@@ -2085,6 +3271,66 @@ describe('InputPrompt', () => {
       unmount();
     });
 
+    it('shows command search suggestions over active export suggestions', async () => {
+      props.shellModeActive = false;
+      const exportSuggestions = [
+        { label: 'html', value: 'html' },
+        { label: 'md', value: 'md' },
+        { label: 'json', value: 'json' },
+        { label: 'jsonl', value: 'jsonl' },
+      ];
+
+      mockedUseCommandCompletion.mockImplementation((buffer) => {
+        const isExportRoot = buffer.text.trim() === '/export';
+        return {
+          ...mockCommandCompletion,
+          showSuggestions: isExportRoot,
+          suggestions: isExportRoot ? exportSuggestions : [],
+          activeSuggestionIndex: 0,
+          isPerfectMatch: isExportRoot,
+        };
+      });
+      vi.mocked(useReverseSearchCompletion).mockImplementation(
+        (_buffer, _data, isActive) => ({
+          ...mockReverseSearchCompletion,
+          suggestions: isActive
+            ? [{ label: 'git status', value: 'git status' }]
+            : [],
+          showSuggestions: !!isActive,
+          activeSuggestionIndex: isActive ? 0 : -1,
+        }),
+      );
+
+      const TestHarness = () => {
+        const buffer = useTextBuffer({
+          initialText: '/export',
+          viewport: { width: 80, height: 20 },
+          isValidPath: () => false,
+          onChange: () => {},
+        });
+        return <InputPrompt {...props} buffer={buffer} />;
+      };
+
+      const { stdin, lastFrame, unmount } = renderWithProviders(
+        <TestHarness />,
+      );
+      await wait();
+
+      stdin.write('\u001B[B');
+      await wait();
+      expect(stripAnsi(lastFrame() ?? '')).toContain('/export md');
+      expect(stripAnsi(lastFrame() ?? '')).toContain('jsonl');
+
+      stdin.write('\x12'); // Ctrl+R
+      await wait();
+
+      const frame = stripAnsi(lastFrame() ?? '');
+      expect(frame).toContain('(r:)');
+      expect(frame).toContain('git status');
+      expect(frame).not.toContain('jsonl');
+      unmount();
+    });
+
     it.skip('expands and collapses long suggestion via Right/Left arrows', async () => {
       props.shellModeActive = false;
       const longValue = 'l'.repeat(200);
@@ -2109,7 +3355,7 @@ describe('InputPrompt', () => {
       expect(clean(stdout.lastFrame())).toContain('→');
 
       stdin.write('\u001B[C');
-      await wait(200);
+      await wait();
       expect(clean(stdout.lastFrame())).toContain('←');
       expect(stdout.lastFrame()).toMatchSnapshot(
         'command-search-expanded-match',
@@ -2333,21 +3579,29 @@ describe('InputPrompt', () => {
       );
       await wait();
 
-      // First paste to set up the placeholder
-      stdin.write(`\x1b[200~${largeContent}\x1b[201~`);
-      await wait();
+      vi.useFakeTimers();
+      try {
+        // First paste to set up the placeholder
+        act(() => {
+          stdin.write(`\x1b[200~${largeContent}\x1b[201~`);
+        });
+        await flush();
 
-      // Wait for paste protection to expire
-      await new Promise((resolve) => setTimeout(resolve, 600));
+        // Advance the protection timer without sleeping in real time.
+        await advanceTimers(500);
 
-      // Submit the input
-      stdin.write('\r');
-      await wait();
+        // Submit the input
+        act(() => {
+          stdin.write('\r');
+        });
+        await flush();
 
-      // Verify onSubmit was called with expanded content
-      expect(props.onSubmit).toHaveBeenCalledWith(largeContent);
-
-      unmount();
+        // Verify onSubmit was called with expanded content
+        expect(props.onSubmit).toHaveBeenCalledWith(largeContent);
+      } finally {
+        vi.useRealTimers();
+        unmount();
+      }
     });
 
     it('should expand same-size placeholders correctly when #2 appears first', async () => {
@@ -2359,27 +3613,37 @@ describe('InputPrompt', () => {
       );
       await wait();
 
-      stdin.write(`\x1b[200~${firstPaste}\x1b[201~`);
-      await wait();
-      stdin.write(`\x1b[200~${secondPaste}\x1b[201~`);
-      await wait();
+      vi.useFakeTimers();
+      try {
+        act(() => {
+          stdin.write(`\x1b[200~${firstPaste}\x1b[201~`);
+        });
+        await flush();
+        act(() => {
+          stdin.write(`\x1b[200~${secondPaste}\x1b[201~`);
+        });
+        await flush();
 
-      mockBuffer.text =
-        '[Pasted Content 1001 chars] #2\n[Pasted Content 1001 chars]';
-      mockBuffer.lines = mockBuffer.text.split('\n');
-      mockBuffer.cursor = [1, '[Pasted Content 1001 chars]'.length];
+        mockBuffer.text =
+          '[Pasted Content 1001 chars] #2\n[Pasted Content 1001 chars]';
+        mockBuffer.lines = mockBuffer.text.split('\n');
+        mockBuffer.cursor = [1, '[Pasted Content 1001 chars]'.length];
 
-      // Wait for paste protection to expire
-      await new Promise((resolve) => setTimeout(resolve, 600));
+        // Advance the protection timer without sleeping in real time.
+        await advanceTimers(500);
 
-      stdin.write('\r');
-      await wait();
+        act(() => {
+          stdin.write('\r');
+        });
+        await flush();
 
-      expect(props.onSubmit).toHaveBeenCalledWith(
-        `${secondPaste}\n${firstPaste}`,
-      );
-
-      unmount();
+        expect(props.onSubmit).toHaveBeenCalledWith(
+          `${secondPaste}\n${firstPaste}`,
+        );
+      } finally {
+        vi.useRealTimers();
+        unmount();
+      }
     });
 
     it('should write expanded placeholder content to shell history', async () => {
@@ -2394,21 +3658,29 @@ describe('InputPrompt', () => {
       );
       await wait();
 
-      stdin.write(`\x1b[200~${largeContent}\x1b[201~`);
-      await wait();
+      vi.useFakeTimers();
+      try {
+        act(() => {
+          stdin.write(`\x1b[200~${largeContent}\x1b[201~`);
+        });
+        await flush();
 
-      // Wait for paste protection to expire
-      await new Promise((resolve) => setTimeout(resolve, 600));
+        // Advance the protection timer without sleeping in real time.
+        await advanceTimers(500);
 
-      stdin.write('\r');
-      await wait();
+        act(() => {
+          stdin.write('\r');
+        });
+        await flush();
 
-      expect(mockShellHistory.addCommandToHistory).toHaveBeenCalledWith(
-        largeContent,
-      );
-      expect(props.onSubmit).toHaveBeenCalledWith(largeContent);
-
-      unmount();
+        expect(mockShellHistory.addCommandToHistory).toHaveBeenCalledWith(
+          largeContent,
+        );
+        expect(props.onSubmit).toHaveBeenCalledWith(largeContent);
+      } finally {
+        vi.useRealTimers();
+        unmount();
+      }
     });
 
     it('should reuse placeholder ID after deletion', async () => {
@@ -2435,32 +3707,43 @@ describe('InputPrompt', () => {
       );
       await wait();
 
+      vi.useFakeTimers();
       const largeContent = 'x'.repeat(1001);
 
-      // First paste - gets ID 1
-      stdin.write(`\x1b[200~${largeContent}\x1b[201~`);
-      await wait();
+      try {
+        // First paste - gets ID 1
+        act(() => {
+          stdin.write(`\x1b[200~${largeContent}\x1b[201~`);
+        });
+        await flush();
 
-      // Verify first placeholder was inserted
-      expect(mockBuffer.text).toBe('[Pasted Content 1001 chars]');
+        // Verify first placeholder was inserted
+        expect(mockBuffer.text).toBe('[Pasted Content 1001 chars]');
 
-      // Press backspace to delete the placeholder (cursor is at end of placeholder)
-      stdin.write('\x7f');
-      await wait();
+        // Press backspace to delete the placeholder (cursor is at end of placeholder)
+        act(() => {
+          stdin.write('\x7f');
+        });
+        await flush();
 
-      // Verify the placeholder was deleted (buffer is now empty)
-      expect(mockBuffer.text).toBe('');
+        // Verify the placeholder was deleted (buffer is now empty)
+        expect(mockBuffer.text).toBe('');
 
-      // Second paste - should reuse ID 1 since the first was deleted
-      stdin.write(`\x1b[200~${largeContent}\x1b[201~`);
-      await wait();
+        // Second paste - should reuse ID 1 since the first was deleted
+        act(() => {
+          stdin.write(`\x1b[200~${largeContent}\x1b[201~`);
+        });
+        await flush();
 
-      // Verify the ID was reused (no #2 suffix)
-      const insertCalls = vi.mocked(mockBuffer.insert).mock.calls;
-      const lastCall = insertCalls[insertCalls.length - 1];
-      expect(lastCall[0]).toBe('[Pasted Content 1001 chars]');
-
-      unmount();
+        // Verify the ID was reused (no #2 suffix)
+        const insertCalls = vi.mocked(mockBuffer.insert).mock.calls;
+        const lastCall = insertCalls[insertCalls.length - 1];
+        expect(lastCall[0]).toBe('[Pasted Content 1001 chars]');
+      } finally {
+        unmount();
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
     });
 
     it('should handle mixed pastes with different character counts', async () => {
@@ -2644,7 +3927,7 @@ describe('InputPrompt', () => {
       vi.mocked(useUIState).mockReturnValue({
         isFeedbackDialogOpen: false,
         messageQueue: [],
-      } as ReturnType<typeof useUIState>);
+      } as unknown as ReturnType<typeof useUIState>);
       vi.mocked(useUIActions).mockReturnValue({
         handleRetryLastPrompt: vi.fn(),
         temporaryCloseFeedbackDialog: vi.fn(),
@@ -2657,7 +3940,7 @@ describe('InputPrompt', () => {
       vi.mocked(useUIState).mockReturnValue({
         isFeedbackDialogOpen: false,
         messageQueue: ['queued msg 1', 'queued msg 2'],
-      } as ReturnType<typeof useUIState>);
+      } as unknown as ReturnType<typeof useUIState>);
       vi.mocked(useUIActions).mockReturnValue({
         handleRetryLastPrompt: vi.fn(),
         temporaryCloseFeedbackDialog: vi.fn(),
@@ -2684,7 +3967,7 @@ describe('InputPrompt', () => {
       vi.mocked(useUIState).mockReturnValue({
         isFeedbackDialogOpen: false,
         messageQueue: ['queued msg'],
-      } as ReturnType<typeof useUIState>);
+      } as unknown as ReturnType<typeof useUIState>);
       vi.mocked(useUIActions).mockReturnValue({
         handleRetryLastPrompt: vi.fn(),
         temporaryCloseFeedbackDialog: vi.fn(),
@@ -2717,7 +4000,7 @@ describe('InputPrompt', () => {
       vi.mocked(useUIState).mockReturnValue({
         isFeedbackDialogOpen: false,
         messageQueue: ['queued msg'],
-      } as ReturnType<typeof useUIState>);
+      } as unknown as ReturnType<typeof useUIState>);
       vi.mocked(useUIActions).mockReturnValue({
         handleRetryLastPrompt: vi.fn(),
         temporaryCloseFeedbackDialog: vi.fn(),
@@ -2744,7 +4027,7 @@ describe('InputPrompt', () => {
       vi.mocked(useUIState).mockReturnValue({
         isFeedbackDialogOpen: false,
         messageQueue: ['stale msg'],
-      } as ReturnType<typeof useUIState>);
+      } as unknown as ReturnType<typeof useUIState>);
       vi.mocked(useUIActions).mockReturnValue({
         handleRetryLastPrompt: vi.fn(),
         temporaryCloseFeedbackDialog: vi.fn(),
@@ -2782,7 +4065,7 @@ describe('InputPrompt', () => {
       vi.mocked(useUIState).mockReturnValue({
         isFeedbackDialogOpen: false,
         messageQueue: ['queued msg'],
-      } as ReturnType<typeof useUIState>);
+      } as unknown as ReturnType<typeof useUIState>);
 
       const { stdin, unmount } = renderWithProviders(
         <InputPrompt {...props} />,
@@ -2793,6 +4076,220 @@ describe('InputPrompt', () => {
       await wait();
 
       expect(mockInputHistory.navigateUp).toHaveBeenCalled();
+      unmount();
+    });
+  });
+
+  // Two-step edge transition: Ctrl+P / Ctrl+N (and arrow ↑/↓) in a non-empty
+  // buffer first snap the cursor to col 0 (Up) or end-of-line (Down) when the
+  // cursor isn't already at that edge, and only on a *second* press do they
+  // walk the input history. This mirrors readline / Claude Code parity called
+  // out in issue #3821. Multi-line transition between visual rows is covered
+  // end-to-end via manual testing (see contributions/3821-readline-shortcuts/
+  // demo.md cases 2 & 3); the unit tests below exercise the single-visual-row
+  // edges where the mock buffer's view of the world is self-consistent.
+  describe('two-step edge transition for history navigation', () => {
+    it('Ctrl+P with cursor mid-line snaps to col 0 without touching history', async () => {
+      // setText('hello') puts the mock's visualCursor at the end of 'hello'.
+      // From that position pressing Ctrl+P should first move cursor to col 0;
+      // it must NOT navigate history on this press.
+      mockBuffer.setText('hello');
+      const { stdin, unmount } = renderWithProviders(
+        <InputPrompt {...props} />,
+      );
+      await wait();
+
+      stdin.write('\u0010'); // Ctrl+P
+      await wait();
+
+      expect(mockBuffer.move).toHaveBeenCalledWith('home');
+      expect(mockInputHistory.navigateUp).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('Ctrl+N with cursor not at end-of-line snaps to end without touching history', async () => {
+      // Manually park the cursor at col 0 (as if a prior Ctrl+P just loaded a
+      // history entry, which lands cursor at offset 0). Pressing Ctrl+N now
+      // should first jump cursor to end-of-line, not navigate history.
+      mockBuffer.setText('hello');
+      mockBuffer.visualCursor = [0, 0]; // simulate "just loaded older history"
+
+      const { stdin, unmount } = renderWithProviders(
+        <InputPrompt {...props} />,
+      );
+      await wait();
+
+      stdin.write('\u000E'); // Ctrl+N
+      await wait();
+
+      expect(mockBuffer.move).toHaveBeenCalledWith('end');
+      expect(mockInputHistory.navigateDown).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('Ctrl+P at col 0 walks history and parks the cursor at offset 0', async () => {
+      // navigateUp returns boolean true on a real history move. We model that
+      // here so the post-navigation moveToOffset(0) side-effect (the "cursor
+      // at start of the restored older entry" rule) is observable.
+      (mockInputHistory.navigateUp as Mock).mockReturnValue(true);
+      mockBuffer.setText('current draft');
+      mockBuffer.visualCursor = [0, 0];
+
+      const { stdin, unmount } = renderWithProviders(
+        <InputPrompt {...props} />,
+      );
+      await wait();
+
+      stdin.write('\u0010'); // Ctrl+P
+      await wait();
+
+      expect(mockInputHistory.navigateUp).toHaveBeenCalled();
+      // Readline "previous-history" lands the cursor at the start of the
+      // restored entry.
+      expect(mockBuffer.moveToOffset).toHaveBeenCalledWith(0);
+      unmount();
+    });
+
+    it('Ctrl+P/N and arrows do not change input history while a tool confirmation owns navigation', async () => {
+      mockedUseUIState.mockReturnValue({
+        isFeedbackDialogOpen: false,
+        messageQueue: [],
+        pendingGeminiHistoryItems: [
+          {
+            type: 'tool_group',
+            tools: [
+              {
+                confirmationDetails: { type: 'ask_user_question' },
+              },
+            ],
+          },
+        ],
+      } as unknown as ReturnType<typeof useUIState>);
+      mockBuffer.setText('draft');
+      mockBuffer.visualCursor = [0, 'draft'.length];
+
+      const { stdin, unmount } = renderWithProviders(
+        <InputPrompt {...props} />,
+      );
+      await wait();
+
+      stdin.write('\u0010'); // Ctrl+P
+      await wait();
+      stdin.write('\u000E'); // Ctrl+N
+      await wait();
+      stdin.write('\u001B[A'); // Up arrow
+      await wait();
+      stdin.write('\u001B[B'); // Down arrow
+      await wait();
+
+      expect(mockInputHistory.navigateUp).not.toHaveBeenCalled();
+      expect(mockInputHistory.navigateDown).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('Ctrl+N falls through to the agent tab bar when there is no newer history', async () => {
+      (mockInputHistory.navigateDown as Mock).mockReturnValue(false);
+      mockedUseAgentViewState.mockReturnValue({
+        activeView: 'main',
+        agents: new Map([['agent-1', {}]]),
+        agentShellFocused: false,
+        agentInputBufferText: '',
+        agentTabBarFocused: false,
+        agentApprovalModes: new Map(),
+      } as unknown as ReturnType<typeof useAgentViewState>);
+      mockBuffer.setText('draft');
+      mockBuffer.visualCursor = [0, 'draft'.length];
+
+      const { stdin, unmount } = renderWithProviders(
+        <InputPrompt {...props} />,
+      );
+      await wait();
+
+      stdin.write('\u000E'); // Ctrl+N
+      await wait();
+
+      expect(mockInputHistory.navigateDown).toHaveBeenCalled();
+      expect(mockViewActions.setAgentTabBarFocused).toHaveBeenCalledWith(true);
+      unmount();
+    });
+
+    it('arrow Down applies the same snap-before-history rule as Ctrl+N', async () => {
+      mockBuffer.setText('hello');
+      mockBuffer.visualCursor = [0, 0];
+
+      const { stdin, unmount } = renderWithProviders(
+        <InputPrompt {...props} />,
+      );
+      await wait();
+
+      stdin.write('\u001B[B'); // Down arrow
+      await wait();
+
+      expect(mockBuffer.move).toHaveBeenCalledWith('end');
+      expect(mockInputHistory.navigateDown).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('arrow Down at end-of-line walks history', async () => {
+      (mockInputHistory.navigateDown as Mock).mockReturnValue(true);
+      mockBuffer.setText('current draft');
+      mockBuffer.visualCursor = [0, 'current draft'.length];
+
+      const { stdin, unmount } = renderWithProviders(
+        <InputPrompt {...props} />,
+      );
+      await wait();
+
+      stdin.write('\u001B[B'); // Down arrow
+      await wait();
+
+      expect(mockInputHistory.navigateDown).toHaveBeenCalled();
+      expect(mockViewActions.setAgentTabBarFocused).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('arrow Down falls through to the agent tab bar when there is no newer history', async () => {
+      (mockInputHistory.navigateDown as Mock).mockReturnValue(false);
+      mockedUseAgentViewState.mockReturnValue({
+        activeView: 'main',
+        agents: new Map([['agent-1', {}]]),
+        agentShellFocused: false,
+        agentInputBufferText: '',
+        agentTabBarFocused: false,
+        agentApprovalModes: new Map(),
+      } as unknown as ReturnType<typeof useAgentViewState>);
+      mockBuffer.setText('draft');
+      mockBuffer.visualCursor = [0, 'draft'.length];
+
+      const { stdin, unmount } = renderWithProviders(
+        <InputPrompt {...props} />,
+      );
+      await wait();
+
+      stdin.write('\u001B[B'); // Down arrow
+      await wait();
+
+      expect(mockInputHistory.navigateDown).toHaveBeenCalled();
+      expect(mockViewActions.setAgentTabBarFocused).toHaveBeenCalledWith(true);
+      unmount();
+    });
+
+    it('arrow Up applies the same two-step rule as Ctrl+P (snap before navigate)', async () => {
+      // The arrow-key history path lives alongside Ctrl+P in InputPrompt.tsx
+      // and the two must stay in lock-step. This test pins the parity so a
+      // future refactor that diverges them will fail.
+      mockBuffer.setText('hello'); // cursor at end via patched setText mock
+
+      const { stdin, unmount } = renderWithProviders(
+        <InputPrompt {...props} />,
+      );
+      await wait();
+
+      stdin.write('\u001B[A'); // Up arrow
+      await wait();
+
+      expect(mockBuffer.move).toHaveBeenCalledWith('home');
+      expect(mockInputHistory.navigateUp).not.toHaveBeenCalled();
       unmount();
     });
   });

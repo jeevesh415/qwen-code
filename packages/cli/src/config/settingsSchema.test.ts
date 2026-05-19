@@ -28,7 +28,7 @@ describe('SettingsSchema', () => {
         'mcp',
         'security',
         'advanced',
-        'webSearch',
+        'plansDirectory',
       ];
 
       expectedSettings.forEach((setting) => {
@@ -118,6 +118,24 @@ describe('SettingsSchema', () => {
       expect(getSettingsSchema().tools.properties.sandboxImage.default).toBe(
         undefined,
       );
+    });
+
+    it('should have top-level proxy setting in schema', () => {
+      expect(getSettingsSchema().proxy).toBeDefined();
+      expect(getSettingsSchema().proxy.type).toBe('string');
+      expect(getSettingsSchema().proxy.category).toBe('Advanced');
+      expect(getSettingsSchema().proxy.requiresRestart).toBe(true);
+      expect(getSettingsSchema().proxy.default).toBe(undefined);
+      expect(getSettingsSchema().proxy.showInDialog).toBe(false);
+    });
+
+    it('should have plansDirectory setting in schema', () => {
+      expect(getSettingsSchema().plansDirectory).toBeDefined();
+      expect(getSettingsSchema().plansDirectory.type).toBe('string');
+      expect(getSettingsSchema().plansDirectory.category).toBe('Advanced');
+      expect(getSettingsSchema().plansDirectory.default).toBe(undefined);
+      expect(getSettingsSchema().plansDirectory.requiresRestart).toBe(true);
+      expect(getSettingsSchema().plansDirectory.showInDialog).toBe(false);
     });
 
     it('should have unique categories', () => {
@@ -218,11 +236,25 @@ describe('SettingsSchema', () => {
       ).toBe(false);
     });
 
+    it('should define Markdown render mode as a user-facing UI enum', () => {
+      const renderMode = getSettingsSchema().ui.properties.renderMode;
+
+      expect(renderMode.type).toBe('enum');
+      expect(renderMode.default).toBe('render');
+      expect(renderMode.requiresRestart).toBe(false);
+      expect(renderMode.showInDialog).toBe(true);
+      expect(renderMode.options).toEqual([
+        { value: 'render', label: 'Render visual previews' },
+        { value: 'raw', label: 'Show raw source' },
+      ]);
+    });
+
     it('should infer Settings type correctly', () => {
       // This test ensures that the Settings type is properly inferred from the schema
       const settings: Settings = {
         ui: {
           theme: 'dark',
+          renderMode: 'raw',
         },
         context: {
           includeDirectories: ['/path/to/dir'],
@@ -232,6 +264,7 @@ describe('SettingsSchema', () => {
 
       // TypeScript should not complain about these properties
       expect(settings.ui?.theme).toBe('dark');
+      expect(settings.ui?.renderMode).toBe('raw');
       expect(settings.context?.includeDirectories).toEqual(['/path/to/dir']);
       expect(settings.context?.loadFromIncludeDirectories).toBe(true);
     });

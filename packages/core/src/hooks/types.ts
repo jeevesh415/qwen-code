@@ -3,6 +3,7 @@
  * Copyright 2026 Qwen Team
  * SPDX-License-Identifier: Apache-2.0
  */
+import type { ChildProcess } from 'child_process';
 import { createDebugLogger } from '../utils/debugLogger.js';
 
 const debugLogger = createDebugLogger('TRUSTED_HOOKS');
@@ -12,6 +13,7 @@ export enum HooksConfigSource {
   User = 'user',
   System = 'system',
   Extensions = 'extensions',
+  Session = 'session',
 }
 
 /**
@@ -46,6 +48,21 @@ export enum HookEventName {
   PermissionRequest = 'PermissionRequest',
   // StopFailure - When the turn ends due to an API error (instead of Stop)
   StopFailure = 'StopFailure',
+  // TodoCreated - When a new todo item is added to the list (Qwen Code specific)
+  TodoCreated = 'TodoCreated',
+  // TodoCompleted - When a todo item's status changes to 'completed' (Qwen Code specific)
+  TodoCompleted = 'TodoCompleted',
+}
+
+/**
+ * Hook execution phase for todo events
+ * Used to split validation from side effects for atomic updates
+ */
+export enum HookPhase {
+  /** Validation phase - hooks should only check and return block/approve decisions, no side effects */
+  Validation = 'validation',
+  /** PostWrite phase - hooks can perform side effects (logging, HTTP sync, etc.) after data is persisted */
+  PostWrite = 'postWrite',
 }
 
 /**
@@ -54,7 +71,7 @@ export enum HookEventName {
 export const HOOKS_CONFIG_FIELDS = ['enabled', 'disabled', 'notifications'];
 
 /**
- * Hook configuration entry
+ * Hook configuration entry for command hooks
  */
 export interface CommandHookConfig {
   type: HookType.Command;
@@ -64,9 +81,119 @@ export interface CommandHookConfig {
   timeout?: number;
   source?: HooksConfigSource;
   env?: Record<string, string>;
+  async?: boolean;
+  shell?: 'bash' | 'powershell';
+  /** Custom status message to display while hook is executing */
+  statusMessage?: string;
 }
 
-export type HookConfig = CommandHookConfig;
+/**
+ * Hook configuration entry for HTTP hooks
+ */
+export interface HttpHookConfig {
+  type: HookType.Http;
+  url: string;
+  headers?: Record<string, string>;
+  allowedEnvVars?: string[];
+  timeout?: number;
+  if?: string;
+  name?: string;
+  description?: string;
+  statusMessage?: string;
+  once?: boolean;
+  source?: HooksConfigSource;
+}
+
+/**
+ * Hook execution outcome - describes the result of hook execution
+ */
+export type HookExecutionOutcome =
+  | 'success' // Hook executed successfully
+  | 'blocking' // Hook blocked the operation
+  | 'non_blocking_error' // Hook failed but doesn't block
+  | 'cancelled'; // Hook was cancelled/aborted
+
+/**
+ * Context provided to function hooks for state access
+ */
+export interface FunctionHookContext {
+  /** Optional messages for conversation context */
+  messages?: Array<Record<string, unknown>>;
+  /** Optional tool use ID for关联 to specific tool call */
+  toolUseID?: string;
+  /** Optional abort signal for cancellation */
+  signal?: AbortSignal;
+}
+
+/**
+ * Function hook callback type
+ * Supports both simple boolean semantics and complex HookOutput semantics
+ * - Return boolean: true=success, false=blocking error
+ * - Return HookOutput: for advanced control over hook behavior
+ * - Return undefined: treated as {continue: true} (success)
+ */
+export type FunctionHookCallback = (
+  input: HookInput,
+  context?: FunctionHookContext,
+) => Promise<HookOutput | boolean | undefined>;
+
+/**
+ * Hook configuration entry for function hooks (Session Hook specific)
+ */
+export interface FunctionHookConfig {
+  type: HookType.Function;
+  id?: string;
+  name?: string;
+  description?: string;
+  timeout?: number;
+  callback: FunctionHookCallback;
+  errorMessage: string;
+  statusMessage?: string;
+  /** Optional callback invoked on successful hook execution */
+  onHookSuccess?: (result: HookExecutionResult) => void;
+}
+
+/**
+ * LLM Hook response format - used by prompt hooks
+ */
+export interface LLMHookResponse {
+  /** true = allow operation, false = block operation */
+  ok: boolean;
+  /** Decision reason (required when ok=false, shown to user) */
+  reason?: string;
+  /** Optional additional context to add to conversation */
+  additionalContext?: string;
+}
+
+/**
+ * Hook configuration entry for prompt hooks
+ * Sends hook input to LLM for single-turn evaluation
+ */
+export interface PromptHookConfig {
+  type: HookType.Prompt;
+  /** Prompt template with $ARGUMENTS placeholder for hook input JSON */
+  prompt: string;
+  /** Optional model override (defaults to the user's current model) */
+  model?: string;
+  /** Timeout in seconds (default 30) */
+  timeout?: number;
+  name?: string;
+  description?: string;
+  source?: HooksConfigSource;
+  statusMessage?: string;
+}
+
+/**
+ * Messages provider callback type for automatically passing conversation history
+ * to function hooks during execution
+ */
+export type MessagesProvider = () => Array<Record<string, unknown>> | undefined;
+
+export type HookConfig =
+  | CommandHookConfig
+  | HttpHookConfig
+  | FunctionHookConfig
+  | PromptHookConfig;
 
 /**
  * Hook definition with matcher
@@ -82,6 +209,9 @@ export interface HookDefinition {
  */
 export enum HookType {
   Command = 'command',
+  Http = 'http',
+  Function = 'function',
+  Prompt = 'prompt',
 }
 
 /**
@@ -89,7 +219,20 @@ export enum HookType {
  */
 export function getHookKey(hook: HookConfig): string {
   const name = hook.name ?? '';
-  return name ? `${name}:${hook.command}` : hook.command;
+  switch (hook.type) {
+    case HookType.Command:
+      return name ? `${name}:${hook.command}` : hook.command;
+    case HookType.Http:
+      return name ? `${name}:${hook.url}` : hook.url;
+    case HookType.Function:
+      return name
+        ? `${name}:${hook.id ?? 'function'}`
+        : (hook.id ?? 'function');
+    case HookType.Prompt:
+      return name ? `${name}:${hook.prompt}` : hook.prompt;
+    default:
+      return name || 'unknown';
+  }
 }
 
 /**
@@ -594,6 +737,7 @@ export enum SessionStartSource {
   Resume = 'resume',
   Clear = 'clear',
   Compact = 'compact',
+  Branch = 'branch',
 }
 
 export enum PermissionMode {
@@ -789,18 +933,126 @@ export interface StopFailureInput extends HookInput {
 export type StopFailureOutput = HookOutput;
 
 /**
+ * Todo item status types
+ */
+export type TodoStatus = 'pending' | 'in_progress' | 'completed';
+
+/**
+ * TodoCreated hook input
+ * Fired when a new todo item is added to the list
+ */
+export interface TodoCreatedInput extends HookInput {
+  hook_event_name: 'TodoCreated';
+  todo_id: string;
+  todo_content: string;
+  todo_status: TodoStatus;
+  all_todos: TodoItem[];
+  /** Execution phase: validation (no side effects) or postWrite (side effects allowed) */
+  phase: HookPhase;
+}
+
+/**
+ * TodoCreated hook output
+ */
+export interface TodoCreatedOutput extends HookOutput {
+  hookSpecificOutput?: {
+    hookEventName: 'TodoCreated';
+    additionalContext?: string;
+  };
+}
+
+/**
+ * TodoCompleted hook input
+ * Fired when a todo item's status changes to 'completed'
+ */
+export interface TodoCompletedInput extends HookInput {
+  hook_event_name: 'TodoCompleted';
+  todo_id: string;
+  todo_content: string;
+  previous_status: 'pending' | 'in_progress';
+  all_todos: TodoItem[];
+  /** Execution phase: validation (no side effects) or postWrite (side effects allowed) */
+  phase: HookPhase;
+}
+
+/**
+ * TodoCompleted hook output
+ */
+export interface TodoCompletedOutput extends HookOutput {
+  hookSpecificOutput?: {
+    hookEventName: 'TodoCompleted';
+    additionalContext?: string;
+  };
+}
+
+/**
+ * Todo item structure (mirrors the one in todoWrite.ts)
+ */
+export interface TodoItem {
+  id: string;
+  content: string;
+  status: TodoStatus;
+}
+
+/**
+ * Changes detected when comparing old and new todo lists
+ */
+export interface TodoChanges {
+  created: TodoItem[];
+  completed: TodoItem[];
+}
+
+/**
+ * Compare old and new todo lists to detect changes
+ * @param oldTodos The previous todo list
+ * @param newTodos The new todo list
+ * @returns TodoChanges containing created and completed items
+ */
+export function detectTodoChanges(
+  oldTodos: TodoItem[],
+  newTodos: TodoItem[],
+): TodoChanges {
+  const oldTodosMap = new Map(oldTodos.map((t) => [t.id, t]));
+
+  const changes: TodoChanges = {
+    created: [],
+    completed: [],
+  };
+
+  for (const newTodo of newTodos) {
+    const oldTodo = oldTodosMap.get(newTodo.id);
+
+    if (!oldTodo) {
+      // New todo created (ID not found in old todos)
+      changes.created.push(newTodo);
+    } else if (
+      oldTodo.status !== 'completed' &&
+      newTodo.status === 'completed'
+    ) {
+      // Todo completed (status changed to 'completed')
+      changes.completed.push(newTodo);
+    }
+  }
+
+  return changes;
+}
+
+/**
  * Hook execution result
  */
 export interface HookExecutionResult {
   hookConfig: HookConfig;
   eventName: HookEventName;
   success: boolean;
+  /** Execution outcome for finer-grained result handling */
+  outcome?: HookExecutionOutcome;
   output?: HookOutput;
   stdout?: string;
   stderr?: string;
   exitCode?: number;
   duration: number;
   error?: Error;
+  isAsync?: boolean; // Indicates if this was an async hook execution
 }
 
 /**
@@ -810,4 +1062,45 @@ export interface HookExecutionPlan {
   eventName: HookEventName;
   hookConfigs: HookConfig[];
   sequential: boolean;
+}
+
+/**
+ * Pending async hook information
+ */
+export interface PendingAsyncHook {
+  hookId: string;
+  hookName: string;
+  hookEvent: HookEventName;
+  sessionId: string;
+  startTime: number;
+  timeout: number;
+  stdout: string;
+  stderr: string;
+  status: 'running' | 'completed' | 'failed' | 'timeout';
+  output?: HookOutput;
+  error?: Error;
+  /**
+   * Reference to the child process for async command hooks.
+   * Used to terminate the process on timeout or cancellation.
+   */
+  process?: ChildProcess;
+}
+
+/**
+ * Async hook output message
+ */
+export interface AsyncHookOutputMessage {
+  type: 'system' | 'info' | 'warning' | 'error';
+  message: string;
+  hookName: string;
+  hookId: string;
+  timestamp: number;
+}
+
+/**
+ * Pending async output collection
+ */
+export interface PendingAsyncOutput {
+  messages: AsyncHookOutputMessage[];
+  contexts: string[];
 }

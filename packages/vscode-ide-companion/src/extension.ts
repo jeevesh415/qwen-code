@@ -21,6 +21,10 @@ import { registerNewCommands } from './commands/index.js';
 import { ReadonlyFileSystemProvider } from './services/readonlyFileSystemProvider.js';
 import { isWindows } from './utils/platform.js';
 
+// Keep the dormant daemon IDE adapter on the VSIX bundle path without wiring it
+// into the active extension flow yet.
+export { createSdkDaemonSessionFactory as __daemonIdeSessionFactoryForBundle } from './services/daemonIdeConnection.js';
+
 const CLI_IDE_COMPANION_IDENTIFIER = 'qwenlm.qwen-code-vscode-ide-companion';
 const INFO_MESSAGE_SHOWN_KEY = 'qwenCodeInfoMessageShown';
 export const DIFF_SCHEME = 'qwen-diff';
@@ -211,6 +215,28 @@ export async function activate(context: vscode.ExtensionContext) {
     createWebViewProvider,
     logger,
     supportsSecondarySidebar,
+  );
+
+  // Register copy commands for webview context menu
+  // Only send to the first provider with an active webview (the one the user right-clicked)
+  const sendCopyToActive = (action: string) => {
+    for (const provider of chatProviderRegistry?.getPermissionAwareProviders() ??
+      []) {
+      if (provider.sendCopyCommand(action)) {
+        break;
+      }
+    }
+  };
+  context.subscriptions.push(
+    vscode.commands.registerCommand('qwen-code.copyMessage', () =>
+      sendCopyToActive('copyMessage'),
+    ),
+    vscode.commands.registerCommand('qwen-code.copyAllMessages', () =>
+      sendCopyToActive('copyAllMessages'),
+    ),
+    vscode.commands.registerCommand('qwen-code.copyLastReply', () =>
+      sendCopyToActive('copyLastReply'),
+    ),
   );
 
   context.subscriptions.push(

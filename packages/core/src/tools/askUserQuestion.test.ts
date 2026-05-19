@@ -27,6 +27,15 @@ describe('AskUserQuestionTool', () => {
     tool = new AskUserQuestionTool(mockConfig);
   });
 
+  describe('tool registration flags', () => {
+    it('is not deferred — must remain visible in the initial tool list', () => {
+      // shouldDefer=true would hide the schema behind ToolSearch and force the
+      // model to discover the tool by name before using it. The model then
+      // tends to skip the structured clarification UX and ask in plain prose.
+      expect(tool.shouldDefer).toBe(false);
+    });
+  });
+
   describe('validateToolParams', () => {
     it('should accept valid params with single question', () => {
       const params = {
@@ -97,6 +106,43 @@ describe('AskUserQuestionTool', () => {
 
       const result = tool.validateToolParams(params);
       expect(result).toContain('between 2 and 4 options');
+    });
+
+    it('should accept params with multiSelect omitted', () => {
+      const params = {
+        questions: [
+          {
+            question: 'Pick a framework?',
+            header: 'Framework',
+            options: [
+              { label: 'React', description: 'A JavaScript library' },
+              { label: 'Vue', description: 'Progressive framework' },
+            ],
+          },
+        ],
+      };
+
+      expect(tool.validateToolParams(params)).toBeNull();
+      expect(() => tool.build(params)).not.toThrow();
+    });
+
+    it('should reject params where multiSelect is not a boolean', () => {
+      const params = {
+        questions: [
+          {
+            question: 'Pick a framework?',
+            header: 'Framework',
+            options: [
+              { label: 'React', description: 'A JavaScript library' },
+              { label: 'Vue', description: 'Progressive framework' },
+            ],
+            multiSelect: 'yes' as unknown as boolean,
+          },
+        ],
+      };
+
+      const result = tool.validateToolParams(params);
+      expect(result).toBe('Question 1: "multiSelect" must be a boolean.');
     });
   });
 

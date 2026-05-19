@@ -83,6 +83,8 @@ export interface SubagentConfig {
   /**
    * Optional model selector.
    * - Omitted or 'inherit': use the main conversation model
+   * - 'fast': use the configured fast model when available; supports
+   *   authType-qualified fastModel settings and silently inherits otherwise
    * - 'model-id': use the given model with the main conversation authType
    * - 'authType:model-id': use the given authType and model ID
    */
@@ -99,6 +101,13 @@ export interface SubagentConfig {
    * If 'auto' or omitted, uses automatic color assignment.
    */
   color?: string;
+
+  /**
+   * When true, this agent always runs as a background task when spawned.
+   * OR'd with the `run_in_background` tool parameter — if either is true,
+   * the agent runs in the background.
+   */
+  background?: boolean;
 
   /**
    * Indicates whether this is a built-in agent.

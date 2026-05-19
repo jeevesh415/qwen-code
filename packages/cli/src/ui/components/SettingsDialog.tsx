@@ -29,8 +29,11 @@ import {
 } from '../../utils/settingsUtils.js';
 import { updateOutputLanguageFile } from '../../utils/languageUtils.js';
 import { useVimMode } from '../contexts/VimModeContext.js';
+import { useCompactMode } from '../contexts/CompactModeContext.js';
+import { useUIActions } from '../contexts/UIActionsContext.js';
 import { createDebugLogger, type Config } from '@qwen-code/qwen-code-core';
 import { useKeypress } from '../hooks/useKeypress.js';
+import { keyMatchers, Command } from '../keyMatchers.js';
 import chalk from 'chalk';
 import { cpSlice, cpLen, stripUnsafeCharacters } from '../utils/textUtils.js';
 import {
@@ -59,6 +62,9 @@ export function SettingsDialog({
 }: SettingsDialogProps): React.JSX.Element {
   // Get vim mode context to sync vim mode changes
   const { vimEnabled, toggleVimEnabled } = useVimMode();
+  // Get compact mode context to sync compact mode changes
+  const { compactMode, setCompactMode } = useCompactMode();
+  const uiActions = useUIActions();
 
   // Mode state: 'settings' or 'scope' (view switching like ThemeDialog)
   const [mode, setMode] = useState<'settings' | 'scope'>('settings');
@@ -184,6 +190,13 @@ export function SettingsDialog({
               toggleVimEnabled().catch((error) => {
                 debugLogger.error('Failed to toggle vim mode:', error);
               });
+            }
+
+            // Special handling for compact mode to sync with CompactModeContext
+            // and refresh static content so already-rendered history updates.
+            if (key === 'ui.compactMode' && newValue !== compactMode) {
+              setCompactMode?.(newValue as boolean);
+              uiActions.refreshStatic();
             }
 
             // Special handling for approval mode to apply to current session
@@ -534,8 +547,8 @@ export function SettingsDialog({
           // Block other keys while editing
           return;
         }
-        if (name === 'up' || name === 'k') {
-          // If editing, commit first
+        if (keyMatchers[Command.SELECTION_UP](key)) {
+          // ↑/k/Ctrl+P all move selection up. If editing, commit first.
           if (editingKey) {
             commitEdit(editingKey);
           }
@@ -550,8 +563,8 @@ export function SettingsDialog({
           } else if (newIndex < scrollOffset) {
             setScrollOffset(newIndex);
           }
-        } else if (name === 'down' || name === 'j') {
-          // If editing, commit first
+        } else if (keyMatchers[Command.SELECTION_DOWN](key)) {
+          // ↓/j/Ctrl+N all move selection down. If editing, commit first.
           if (editingKey) {
             commitEdit(editingKey);
           }

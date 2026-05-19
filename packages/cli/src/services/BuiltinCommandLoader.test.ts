@@ -81,12 +81,14 @@ vi.mock('../ui/commands/bugCommand.js', () => ({ bugCommand: {} }));
 vi.mock('../ui/commands/clearCommand.js', () => ({ clearCommand: {} }));
 vi.mock('../ui/commands/compressCommand.js', () => ({ compressCommand: {} }));
 vi.mock('../ui/commands/docsCommand.js', () => ({ docsCommand: {} }));
+vi.mock('../ui/commands/exportCommand.js', () => ({ exportCommand: {} }));
 vi.mock('../ui/commands/editorCommand.js', () => ({ editorCommand: {} }));
 vi.mock('../ui/commands/extensionsCommand.js', () => ({
   extensionsCommand: {},
 }));
 vi.mock('../ui/commands/helpCommand.js', () => ({ helpCommand: {} }));
 vi.mock('../ui/commands/memoryCommand.js', () => ({ memoryCommand: {} }));
+vi.mock('../ui/commands/insightCommand.js', () => ({ insightCommand: {} }));
 vi.mock('../ui/commands/modelCommand.js', () => ({
   modelCommand: { name: 'model' },
 }));
@@ -122,6 +124,8 @@ describe('BuiltinCommandLoader', () => {
       getFolderTrust: vi.fn().mockReturnValue(true),
       getUseModelRouter: () => false,
       getDisableAllHooks: vi.fn().mockReturnValue(false),
+      getManagedAutoMemoryEnabled: vi.fn().mockReturnValue(true),
+      isLspEnabled: vi.fn().mockReturnValue(false),
     } as unknown as Config;
 
     restoreCommandMock.mockReturnValue({
@@ -205,6 +209,22 @@ describe('BuiltinCommandLoader', () => {
     const modelCmd = commands.find((c) => c.name === 'model');
     expect(modelCmd).toBeDefined();
     expect(modelCmd?.name).toBe('model');
+  });
+
+  it('should include lsp command only when LSP is enabled', async () => {
+    const disabledLoader = new BuiltinCommandLoader(mockConfig);
+    const disabledCommands = await disabledLoader.loadCommands(
+      new AbortController().signal,
+    );
+    expect(disabledCommands.find((c) => c.name === 'lsp')).toBeUndefined();
+
+    (mockConfig.isLspEnabled as Mock).mockReturnValue(true);
+    const enabledLoader = new BuiltinCommandLoader(mockConfig);
+    const enabledCommands = await enabledLoader.loadCommands(
+      new AbortController().signal,
+    );
+
+    expect(enabledCommands.find((c) => c.name === 'lsp')).toBeDefined();
   });
 
   it('should still load all other commands when ideCommand() throws', async () => {

@@ -9,12 +9,14 @@ import { Box, Text } from 'ink';
 import { theme } from '../../semantic-colors.js';
 import { useTerminalSize } from '../../hooks/useTerminalSize.js';
 import { useKeypress } from '../../hooks/useKeypress.js';
+import { keyMatchers, Command } from '../../keyMatchers.js';
 import { useConfig } from '../../contexts/ConfigContext.js';
 import { loadSettings, SettingScope } from '../../../config/settings.js';
 import {
   HooksConfigSource,
   type HookDefinition,
   type HookConfig,
+  type SessionHookEntry,
   createDebugLogger,
   HOOKS_CONFIG_FIELDS,
 } from '@qwen-code/qwen-code-core';
@@ -40,13 +42,24 @@ const debugLogger = createDebugLogger('HOOKS_DIALOG');
  * Type guard to check if a value is a valid HookConfig
  */
 function isValidHookConfig(config: unknown): config is HookConfig {
-  return (
-    typeof config === 'object' &&
-    config !== null &&
-    'type' in config &&
-    'command' in config &&
-    typeof (config as HookConfig).command === 'string'
-  );
+  if (typeof config !== 'object' || config === null || !('type' in config)) {
+    return false;
+  }
+  const obj = config as Record<string, unknown>;
+  // Check based on type
+  if (obj['type'] === 'command') {
+    return 'command' in obj && typeof obj['command'] === 'string';
+  }
+  if (obj['type'] === 'http') {
+    return 'url' in obj && typeof obj['url'] === 'string';
+  }
+  if (obj['type'] === 'function') {
+    return 'callback' in obj && typeof obj['callback'] === 'function';
+  }
+  if (obj['type'] === 'prompt') {
+    return 'prompt' in obj && typeof obj['prompt'] === 'string';
+  }
+  return false;
 }
 
 /**
@@ -80,29 +93,52 @@ function isValidHookDefinition(def: unknown): def is HookDefinition {
 
 /**
  * Type guard to check if a value is a valid hooks record
+ * Note: This validates the structure but allows individual events to have
+ * invalid configs - those will be filtered out during processing.
  */
-function isValidHooksRecord(
-  hooks: unknown,
-): hooks is Record<string, HookDefinition[]> {
+function isValidHooksRecord(hooks: unknown): hooks is Record<string, unknown> {
   if (typeof hooks !== 'object' || hooks === null) {
     return false;
   }
+  // Basic structure check - must be a record with array values for event keys
   const record = hooks as Record<string, unknown>;
   for (const [key, value] of Object.entries(record)) {
     // Skip non-event configuration fields
     if (HOOKS_CONFIG_FIELDS.includes(key)) {
       continue;
     }
+    // Event values should be arrays (even if contents are invalid)
     if (!Array.isArray(value)) {
       return false;
     }
-    for (const def of value) {
-      if (!isValidHookDefinition(def)) {
-        return false;
-      }
-    }
   }
   return true;
+}
+
+/**
+ * Safely extract hook definitions for a specific event
+ * Returns empty array if the definitions are invalid
+ */
+function getValidHookDefinitions(
+  hooksRecord: Record<string, unknown>,
+  eventName: string,
+): HookDefinition[] {
+  const value = hooksRecord[eventName];
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const result: HookDefinition[] = [];
+  for (const def of value) {
+    if (isValidHookDefinition(def)) {
+      result.push(def);
+    } else {
+      debugLogger.warn(
+        `Skipping invalid hook definition for ${eventName}:`,
+        def,
+      );
+    }
+  }
+  return result;
 }
 
 export function HooksManagementDialog({
@@ -165,9 +201,9 @@ export function HooksManagementDialog({
           break;
 
         case HOOKS_MANAGEMENT_STEPS.HOOKS_LIST:
-          if (key.name === 'up') {
+          if (keyMatchers[Command.SELECTION_UP](key)) {
             setListSelectedIndex((prev) => Math.max(0, prev - 1));
-          } else if (key.name === 'down') {
+          } else if (keyMatchers[Command.SELECTION_DOWN](key)) {
             setListSelectedIndex((prev) =>
               Math.min(hooks.length - 1, prev + 1),
             );
@@ -190,9 +226,9 @@ export function HooksManagementDialog({
           if (key.name === 'escape') {
             handleNavigateBack();
           } else if (selectedHook && selectedHook.configs.length > 0) {
-            if (key.name === 'up') {
+            if (keyMatchers[Command.SELECTION_UP](key)) {
               setDetailSelectedIndex((prev) => Math.max(0, prev - 1));
-            } else if (key.name === 'down') {
+            } else if (keyMatchers[Command.SELECTION_DOWN](key)) {
               setDetailSelectedIndex((prev) =>
                 Math.min(selectedHook.configs.length - 1, prev + 1),
               );
@@ -238,11 +274,12 @@ export function HooksManagementDialog({
     for (const eventName of DISPLAY_HOOK_EVENTS) {
       const hookInfo = createEmptyHookEventInfo(eventName);
 
-      // Get hooks from user settings (with type validation)
+      // Get hooks from user settings (with per-event validation)
       const userSettingsRecord = userSettings as Record<string, unknown>;
       const userHooksRaw = userSettingsRecord?.['hooks'];
-      if (isValidHooksRecord(userHooksRaw) && userHooksRaw[eventName]) {
-        for (const def of userHooksRaw[eventName]) {
+      if (isValidHooksRecord(userHooksRaw)) {
+        const userDefs = getValidHookDefinitions(userHooksRaw, eventName);
+        for (const def of userDefs) {
           for (const hookConfig of def.hooks) {
             hookInfo.configs.push({
               config: hookConfig,
@@ -254,17 +291,18 @@ export function HooksManagementDialog({
         }
       }
 
-      // Get hooks from workspace settings (with type validation)
+      // Get hooks from workspace settings (with per-event validation)
       const workspaceSettingsRecord = workspaceSettings as Record<
         string,
         unknown
       >;
       const workspaceHooksRaw = workspaceSettingsRecord?.['hooks'];
-      if (
-        isValidHooksRecord(workspaceHooksRaw) &&
-        workspaceHooksRaw[eventName]
-      ) {
-        for (const def of workspaceHooksRaw[eventName]) {
+      if (isValidHooksRecord(workspaceHooksRaw)) {
+        const workspaceDefs = getValidHookDefinitions(
+          workspaceHooksRaw,
+          eventName,
+        );
+        for (const def of workspaceDefs) {
           for (const hookConfig of def.hooks) {
             hookInfo.configs.push({
               config: hookConfig,
@@ -299,6 +337,33 @@ export function HooksManagementDialog({
         }
       }
 
+      // Get session hooks from SessionHooksManager
+      const hookSystem = config.getHookSystem();
+      if (hookSystem) {
+        const sessionId = config.getSessionId();
+        if (sessionId) {
+          const sessionHooksManager = hookSystem.getSessionHooksManager();
+          const allSessionHooks =
+            sessionHooksManager.getAllSessionHooks(sessionId);
+
+          // Filter hooks for this event
+          const eventSessionHooks = allSessionHooks.filter(
+            (hook: SessionHookEntry) => hook.eventName === eventName,
+          );
+
+          for (const sessionHook of eventSessionHooks) {
+            // Session hooks have matcher stored separately from config
+            hookInfo.configs.push({
+              config: sessionHook.config as HookConfig,
+              source: HooksConfigSource.Session,
+              sourceDisplay: t('Session (temporary)'),
+              matcher: sessionHook.matcher,
+              enabled: true,
+            });
+          }
+        }
+      }
+
       result.push(hookInfo);
     }
 
@@ -311,7 +376,9 @@ export function HooksManagementDialog({
     setIsLoading(true);
     setLoadError(null);
     try {
+      debugLogger.debug('Fetching hooks data for dialog');
       const hooksData = fetchHooksData();
+      debugLogger.debug('Hooks data fetched:', hooksData.length, 'events');
       if (!cancelled) {
         setHooks(hooksData);
       }

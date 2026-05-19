@@ -17,6 +17,7 @@ import {
   PreCompactTrigger,
   PostCompactTrigger,
   NotificationType,
+  HookPhase,
 } from './types.js';
 import type { StopFailureErrorType } from './types.js';
 import type { Config } from '../config/config.js';
@@ -25,6 +26,7 @@ import type {
   HookRunner,
   HookAggregator,
   AggregatedHookResult,
+  SessionHooksManager,
 } from './index.js';
 import type { HookConfig, HookOutput, PermissionSuggestion } from './types.js';
 import type { HookExecutionResult } from './types.js';
@@ -40,6 +42,7 @@ describe('HookEventHandler', () => {
   let mockHookPlanner: HookPlanner;
   let mockHookRunner: HookRunner;
   let mockHookAggregator: HookAggregator;
+  let mockSessionHooksManager: SessionHooksManager;
   let hookEventHandler: HookEventHandler;
 
   beforeEach(() => {
@@ -62,11 +65,26 @@ describe('HookEventHandler', () => {
       aggregateResults: vi.fn(),
     } as unknown as HookAggregator;
 
+    mockSessionHooksManager = {
+      getMatchingHooks: vi.fn().mockReturnValue([]),
+      getHooksForEvent: vi.fn().mockReturnValue([]),
+      hasSessionHooks: vi.fn().mockReturnValue(false),
+      addSessionHook: vi.fn(),
+      addFunctionHook: vi.fn(),
+      removeHook: vi.fn(),
+      removeFunctionHook: vi.fn(),
+      clearSessionHooks: vi.fn(),
+      getActiveSessions: vi.fn().mockReturnValue([]),
+      getHookCount: vi.fn().mockReturnValue(0),
+      getAllSessionHooks: vi.fn().mockReturnValue([]),
+    } as unknown as SessionHooksManager;
+
     hookEventHandler = new HookEventHandler(
       mockConfig,
       mockHookPlanner,
       mockHookRunner,
       mockHookAggregator,
+      mockSessionHooksManager,
     );
   });
 
@@ -722,6 +740,10 @@ describe('HookEventHandler', () => {
         expect.any(Function), // onHookStart callback
         expect.any(Function), // onHookEnd callback
         undefined, // signal
+        expect.objectContaining({
+          messages: undefined,
+          toolUseID: 'toolu_test111',
+        }), // functionContext
       );
     });
 
@@ -920,6 +942,116 @@ describe('HookEventHandler', () => {
       expect(result.success).toBe(false);
       expect(result.errors).toHaveLength(1);
       expect(result.errors[0].message).toBe('PreToolUse planner error');
+      expect(result.finalOutput).toBeUndefined();
+    });
+  });
+
+  describe('todo hook fail-closed behavior', () => {
+    it('should block TodoCreated when hook execution setup fails', async () => {
+      vi.mocked(mockHookPlanner.createExecutionPlan).mockImplementation(() => {
+        throw new Error('TodoCreated planner error');
+      });
+
+      const result = await hookEventHandler.fireTodoCreatedEvent(
+        'todo-1',
+        'secret token: abc123',
+        'pending',
+        [{ id: 'todo-1', content: 'secret token: abc123', status: 'pending' }],
+        HookPhase.Validation,
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].message).toBe('TodoCreated planner error');
+      expect(result.finalOutput).toEqual({
+        decision: 'block',
+        reason:
+          'Hook system failed while processing TodoCreated: TodoCreated planner error',
+      });
+    });
+
+    it('should block TodoCompleted when hook execution setup fails', async () => {
+      vi.mocked(mockHookPlanner.createExecutionPlan).mockImplementation(() => {
+        throw new Error('TodoCompleted planner error');
+      });
+
+      const result = await hookEventHandler.fireTodoCompletedEvent(
+        'todo-1',
+        'internal host: db.internal',
+        'in_progress',
+        [
+          {
+            id: 'todo-1',
+            content: 'internal host: db.internal',
+            status: 'completed',
+          },
+        ],
+        HookPhase.Validation,
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].message).toBe('TodoCompleted planner error');
+      expect(result.finalOutput).toEqual({
+        decision: 'block',
+        reason:
+          'Hook system failed while processing TodoCompleted: TodoCompleted planner error',
+      });
+    });
+
+    it('should redact sensitive todo fields from hook telemetry', async () => {
+      const mockPlan = createMockExecutionPlan([
+        {
+          type: HookType.Command,
+          command: 'echo test',
+          source: HooksConfigSource.Project,
+        },
+      ]);
+      vi.mocked(mockHookPlanner.createExecutionPlan).mockReturnValue(mockPlan);
+      vi.mocked(mockHookRunner.executeHooksParallel).mockResolvedValue([
+        {
+          hookConfig: {
+            type: HookType.Command,
+            command: 'echo test',
+            source: HooksConfigSource.Project,
+          },
+          eventName: HookEventName.TodoCreated,
+          success: true,
+          output: undefined,
+          duration: 12,
+          exitCode: 0,
+          stdout: '',
+          stderr: '',
+        },
+      ]);
+      vi.mocked(mockHookAggregator.aggregateResults).mockReturnValue(
+        createMockAggregatedResult(true),
+      );
+
+      await hookEventHandler.fireTodoCreatedEvent(
+        'todo-1',
+        'api_key=super-secret',
+        'pending',
+        [
+          {
+            id: 'todo-1',
+            content: 'api_key=super-secret',
+            status: 'pending',
+          },
+        ],
+        HookPhase.PostWrite,
+      );
+
+      expect(logHookCall).toHaveBeenCalledTimes(1);
+      const hookCallEvent = vi.mocked(logHookCall).mock.calls[0]?.[1];
+      expect(hookCallEvent?.hook_input).toMatchObject({
+        hook_event_name: HookEventName.TodoCreated,
+        todo_id: 'todo-1',
+        todo_status: 'pending',
+        phase: HookPhase.PostWrite,
+      });
+      expect(hookCallEvent?.hook_input).not.toHaveProperty('todo_content');
+      expect(hookCallEvent?.hook_input).not.toHaveProperty('all_todos');
     });
   });
 
@@ -2942,6 +3074,136 @@ describe('HookEventHandler', () => {
         mockConfig,
         expect.objectContaining({
           hook_event_name: HookEventName.Stop,
+        }),
+      );
+    });
+  });
+
+  describe('MessagesProvider integration', () => {
+    it('should accept messagesProvider in constructor', () => {
+      const messagesProvider = vi
+        .fn()
+        .mockReturnValue([{ role: 'user', content: 'Hello' }]);
+
+      const handler = new HookEventHandler(
+        mockConfig,
+        mockHookPlanner,
+        mockHookRunner,
+        mockHookAggregator,
+        mockSessionHooksManager,
+        messagesProvider,
+      );
+
+      expect(handler.getMessagesProvider()).toBe(messagesProvider);
+    });
+
+    it('should set messagesProvider via setMessagesProvider', () => {
+      hookEventHandler.setMessagesProvider(vi.fn().mockReturnValue([]));
+      expect(hookEventHandler.getMessagesProvider()).toBeDefined();
+    });
+
+    it('should pass messages to function hooks via context', async () => {
+      const messages = [{ role: 'user', content: 'Test message' }];
+      const messagesProvider = vi.fn().mockReturnValue(messages);
+
+      hookEventHandler.setMessagesProvider(messagesProvider);
+
+      const mockPlan = createMockExecutionPlan([
+        {
+          type: HookType.Command,
+          command: 'echo test',
+          source: HooksConfigSource.Project,
+        },
+      ]);
+
+      vi.mocked(mockHookPlanner.createExecutionPlan).mockReturnValue(mockPlan);
+      vi.mocked(mockHookRunner.executeHooksParallel).mockResolvedValue([]);
+
+      await hookEventHandler.firePreToolUseEvent(
+        'Bash',
+        { command: 'ls' },
+        'toolu_test',
+        PermissionMode.Default,
+      );
+
+      // Verify context was passed with messages
+      expect(mockHookRunner.executeHooksParallel).toHaveBeenCalledWith(
+        expect.any(Array),
+        HookEventName.PreToolUse,
+        expect.any(Object),
+        expect.any(Function),
+        expect.any(Function),
+        undefined,
+        expect.objectContaining({
+          messages,
+          toolUseID: 'toolu_test',
+        }),
+      );
+    });
+
+    it('should pass toolUseID from input to context', async () => {
+      const mockPlan = createMockExecutionPlan([
+        {
+          type: HookType.Command,
+          command: 'echo test',
+          source: HooksConfigSource.Project,
+        },
+      ]);
+
+      vi.mocked(mockHookPlanner.createExecutionPlan).mockReturnValue(mockPlan);
+      vi.mocked(mockHookRunner.executeHooksParallel).mockResolvedValue([]);
+
+      await hookEventHandler.firePostToolUseEvent(
+        'Write',
+        { file_path: '/test.txt' },
+        { content: 'test' },
+        'toolu_12345',
+        PermissionMode.Default,
+      );
+
+      expect(mockHookRunner.executeHooksParallel).toHaveBeenCalledWith(
+        expect.any(Array),
+        HookEventName.PostToolUse,
+        expect.any(Object),
+        expect.any(Function),
+        expect.any(Function),
+        undefined,
+        expect.objectContaining({
+          toolUseID: 'toolu_12345',
+        }),
+      );
+    });
+
+    it('should handle undefined messagesProvider', async () => {
+      // No messagesProvider set
+      const mockPlan = createMockExecutionPlan([
+        {
+          type: HookType.Command,
+          command: 'echo test',
+          source: HooksConfigSource.Project,
+        },
+      ]);
+
+      vi.mocked(mockHookPlanner.createExecutionPlan).mockReturnValue(mockPlan);
+      vi.mocked(mockHookRunner.executeHooksParallel).mockResolvedValue([]);
+
+      await hookEventHandler.firePreToolUseEvent(
+        'Bash',
+        { command: 'ls' },
+        'toolu_test',
+        PermissionMode.Default,
+      );
+
+      expect(mockHookRunner.executeHooksParallel).toHaveBeenCalledWith(
+        expect.any(Array),
+        HookEventName.PreToolUse,
+        expect.any(Object),
+        expect.any(Function),
+        expect.any(Function),
+        undefined,
+        expect.objectContaining({
+          messages: undefined,
+          toolUseID: 'toolu_test',
         }),
       );
     });

@@ -306,6 +306,46 @@ describe('DefaultOpenAICompatibleProvider', () => {
       expect(result.max_tokens).toBe(8000); // GPT-4 has 16K limit, min(16K, 8K) = 8K
     });
 
+    it('should not inject max_tokens when samplingParams is set without it (e.g. GPT-5 / o-series)', () => {
+      // GPT-5 / o-series on Azure reject max_tokens entirely.
+      // When the user sets samplingParams without max_tokens, honor the opt-out.
+      const cfg = {
+        ...mockContentGeneratorConfig,
+        samplingParams: { max_completion_tokens: 4096 },
+      } as ContentGeneratorConfig;
+      const p = new DefaultOpenAICompatibleProvider(cfg, mockCliConfig);
+
+      const request: OpenAI.Chat.ChatCompletionCreateParams = {
+        model: 'gpt-4',
+        messages: [{ role: 'user', content: 'Hello' }],
+      };
+
+      const result = p.buildRequest(request, 'prompt-id');
+
+      expect(result.max_tokens).toBeUndefined();
+    });
+
+    it('should pass samplingParams.max_tokens through verbatim, bypassing the model cap', () => {
+      // When samplingParams is the source of truth, even max_tokens values that
+      // exceed the known model output limit pass through unchanged —
+      // no automatic capping.
+      const cfg = {
+        ...mockContentGeneratorConfig,
+        samplingParams: { max_tokens: 100000 },
+      } as ContentGeneratorConfig;
+      const p = new DefaultOpenAICompatibleProvider(cfg, mockCliConfig);
+
+      const request: OpenAI.Chat.ChatCompletionCreateParams = {
+        model: 'gpt-4', // known model, 16K output limit — would normally cap.
+        messages: [{ role: 'user', content: 'Hello' }],
+        max_tokens: 100000,
+      };
+
+      const result = p.buildRequest(request, 'prompt-id');
+
+      expect(result.max_tokens).toBe(100000);
+    });
+
     it('should handle streaming requests', () => {
       const streamingRequest: OpenAI.Chat.ChatCompletionCreateParams = {
         model: 'gpt-4',
@@ -384,6 +424,87 @@ describe('DefaultOpenAICompatibleProvider', () => {
       expect(result.temperature).toBe(0.7);
       expect(result.max_tokens).toBe(8000); // GPT-4 has 16K limit, min(16K, 8K) = 8K
       expect(result).not.toHaveProperty('custom_param');
+    });
+
+    it('mirrors reasoning_content into reasoning for Qwen3 assistant history turns without mutating the source request', () => {
+      const originalRequest: OpenAI.Chat.ChatCompletionCreateParams = {
+        model: 'Qwen/Qwen3.6-35B-A3B',
+        messages: [
+          { role: 'user', content: 'First turn' },
+          {
+            role: 'assistant',
+            content: 'Visible answer',
+            reasoning_content: 'Preserved chain of thought',
+          } as OpenAI.Chat.ChatCompletionAssistantMessageParam & {
+            reasoning_content: string;
+            reasoning?: string;
+          },
+          { role: 'user', content: 'Second turn' },
+        ],
+      };
+
+      const result = provider.buildRequest(originalRequest, 'prompt-id');
+      const assistant = result.messages?.[1] as {
+        reasoning_content?: string;
+        reasoning?: string;
+      };
+
+      expect(assistant.reasoning_content).toBe('Preserved chain of thought');
+      expect(assistant.reasoning).toBe('Preserved chain of thought');
+      expect(
+        (originalRequest.messages[1] as { reasoning?: string }).reasoning,
+      ).toBeUndefined();
+    });
+
+    it('does not overwrite an explicit reasoning field on Qwen3 assistant history turns', () => {
+      const originalRequest: OpenAI.Chat.ChatCompletionCreateParams = {
+        model: 'Qwen3-32B',
+        messages: [
+          {
+            role: 'assistant',
+            content: 'Visible answer',
+            reasoning_content: 'Legacy reasoning field',
+            reasoning: 'Canonical reasoning field',
+          } as OpenAI.Chat.ChatCompletionAssistantMessageParam & {
+            reasoning_content: string;
+            reasoning: string;
+          },
+        ],
+      };
+
+      const result = provider.buildRequest(originalRequest, 'prompt-id');
+      const assistant = result.messages?.[0] as {
+        reasoning_content?: string;
+        reasoning?: string;
+      };
+
+      expect(assistant.reasoning).toBe('Canonical reasoning field');
+      expect(assistant.reasoning_content).toBe('Legacy reasoning field');
+    });
+
+    it('does not mirror reasoning_content for non-Qwen3 OpenAI-compatible models', () => {
+      const originalRequest: OpenAI.Chat.ChatCompletionCreateParams = {
+        model: 'gpt-4o',
+        messages: [
+          {
+            role: 'assistant',
+            content: 'Visible answer',
+            reasoning_content: 'Preserved chain of thought',
+          } as OpenAI.Chat.ChatCompletionAssistantMessageParam & {
+            reasoning_content: string;
+            reasoning?: string;
+          },
+        ],
+      };
+
+      const result = provider.buildRequest(originalRequest, 'prompt-id');
+      const assistant = result.messages?.[0] as {
+        reasoning_content?: string;
+        reasoning?: string;
+      };
+
+      expect(assistant.reasoning_content).toBe('Preserved chain of thought');
+      expect(assistant.reasoning).toBeUndefined();
     });
   });
 });

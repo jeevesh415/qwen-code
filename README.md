@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@qwen-code/qwen-code.svg)](https://www.npmjs.com/package/@qwen-code/qwen-code)
 [![License](https://img.shields.io/github/license/QwenLM/qwen-code.svg)](./LICENSE)
-[![Node.js Version](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org/)
+[![Node.js Version](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen.svg)](https://nodejs.org/)
 [![Downloads](https://img.shields.io/npm/dm/@qwen-code/qwen-code.svg)](https://www.npmjs.com/package/@qwen-code/qwen-code)
 
 <a href="https://trendshift.io/repositories/15287" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15287" alt="QwenLM%2Fqwen-code | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
@@ -24,7 +24,7 @@
 
 - **2026-04-13**: Qwen OAuth free tier policy update: daily quota adjusted to 100 requests/day (from 1,000).
 
-- **2026-04-02**: Qwen3.6-Plus is now live! Sign in via Qwen OAuth to use it directly, or get an API key from [Alibaba Cloud ModelStudio](https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=doc#/doc/?type=model&url=2840914_2&modelId=qwen3.6-plus) to access it through the OpenAI-compatible API.
+- **2026-04-02**: Qwen3.6-Plus is now live! Get an API key from [Alibaba Cloud ModelStudio](https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=doc#/doc/?type=model&url=2840914_2&modelId=qwen3.6-plus) to access it through the OpenAI-compatible API.
 
 - **2026-02-16**: Qwen3.5-Plus is now live!
 
@@ -49,10 +49,12 @@ Qwen Code is an open-source AI agent for the terminal, optimized for Qwen series
 bash -c "$(curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.sh)"
 ```
 
-#### Windows (Run as Administrator CMD)
+#### Windows (Run as Administrator)
+
+Works in both Command Prompt and PowerShell:
 
 ```cmd
-curl -fsSL -o %TEMP%\install-qwen.bat https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.bat && %TEMP%\install-qwen.bat
+powershell -Command "Invoke-WebRequest 'https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.bat' -OutFile (Join-Path $env:TEMP 'install-qwen.bat'); & (Join-Path $env:TEMP 'install-qwen.bat')"
 ```
 
 > **Note**: It's recommended to restart your terminal after installation to ensure environment variables take effect.
@@ -61,7 +63,7 @@ curl -fsSL -o %TEMP%\install-qwen.bat https://qwen-code-assets.oss-cn-hangzhou.a
 
 #### Prerequisites
 
-Make sure you have Node.js 20 or later installed. Download it from [nodejs.org](https://nodejs.org/en/download).
+Make sure you have Node.js 22 or later installed. Download it from [nodejs.org](https://nodejs.org/en/download).
 
 #### NPM
 
@@ -118,26 +120,16 @@ Then follow the instructions inside to install, authenticate, and use Qwen Code 
 
 ## Authentication
 
-Qwen Code supports two authentication methods:
+Qwen Code supports the following authentication methods:
 
-- **Qwen OAuth (recommended & free)**: sign in with your `qwen.ai` account in a browser.
-- **API-KEY**: use an API key to connect to any supported provider (OpenAI, Anthropic, Google GenAI, Alibaba Cloud ModelStudio, and other compatible endpoints).
+- **API Key (recommended)**: use an API key from Alibaba Cloud Model Studio ([Beijing](https://bailian.console.aliyun.com/) / [intl](https://modelstudio.console.alibabacloud.com/)) or any supported provider (OpenAI, Anthropic, Google GenAI, and other compatible endpoints).
+- **Coding Plan**: subscribe to the Alibaba Cloud Coding Plan ([Beijing](https://bailian.console.aliyun.com/cn-beijing?tab=coding-plan#/efm/coding-plan-index) / [intl](https://modelstudio.console.alibabacloud.com/?tab=coding-plan#/efm/coding-plan-index)) for a fixed monthly fee with higher quotas.
 
-#### Qwen OAuth (recommended)
+> ⚠️ **Qwen OAuth was discontinued on April 15, 2026.** If you were previously using Qwen OAuth, please switch to one of the methods above. Run `qwen` and then `/auth` to reconfigure.
 
-Start `qwen`, then run:
+#### API Key (recommended)
 
-```bash
-/auth
-```
-
-Choose **Qwen OAuth** and complete the browser flow. Your credentials are cached locally so you usually won't need to log in again.
-
-> **Note:** In non-interactive or headless environments (e.g., CI, SSH, containers), you typically **cannot** complete the OAuth browser login flow. In these cases, please use the API-KEY authentication method.
-
-#### API-KEY (flexible)
-
-Use this if you want more flexibility over which provider and model to use. Supports multiple protocols:
+Use an API key to connect to Alibaba Cloud Model Studio or any supported provider. Supports multiple protocols:
 
 - **OpenAI-compatible**: Alibaba Cloud ModelStudio, ModelScope, OpenAI, OpenRouter, and other OpenAI-compatible providers
 - **Anthropic**: Claude models
@@ -357,14 +349,92 @@ Use the `/model` command at any time to switch between all configured models.
 
 > **Security note:** Never commit API keys to version control. The `~/.qwen/settings.json` file is in your home directory and should stay private.
 
+#### Local Model Setup (Ollama / vLLM)
+
+You can also run models locally — no API key or cloud account needed. This is not an authentication method; instead, configure your local model endpoint in `~/.qwen/settings.json` using the `modelProviders` field.
+
+Set `generationConfig.contextWindowSize` inside the matching provider entry
+and adjust it to the context length configured on your local server.
+
+<details>
+<summary>Ollama setup</summary>
+
+1. Install Ollama from [ollama.com](https://ollama.com/)
+2. Pull a model: `ollama pull qwen3:32b`
+3. Configure `~/.qwen/settings.json`:
+
+```json
+{
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "qwen3:32b",
+        "name": "Qwen3 32B (Ollama)",
+        "baseUrl": "http://localhost:11434/v1",
+        "description": "Qwen3 32B running locally via Ollama",
+        "generationConfig": {
+          "contextWindowSize": 131072
+        }
+      }
+    ]
+  },
+  "security": {
+    "auth": {
+      "selectedType": "openai"
+    }
+  },
+  "model": {
+    "name": "qwen3:32b"
+  }
+}
+```
+
+</details>
+
+<details>
+<summary>vLLM setup</summary>
+
+1. Install vLLM: `pip install vllm`
+2. Start the server: `vllm serve Qwen/Qwen3-32B`
+3. Configure `~/.qwen/settings.json`:
+
+```json
+{
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "Qwen/Qwen3-32B",
+        "name": "Qwen3 32B (vLLM)",
+        "baseUrl": "http://localhost:8000/v1",
+        "description": "Qwen3 32B running locally via vLLM",
+        "generationConfig": {
+          "contextWindowSize": 131072
+        }
+      }
+    ]
+  },
+  "security": {
+    "auth": {
+      "selectedType": "openai"
+    }
+  },
+  "model": {
+    "name": "Qwen/Qwen3-32B"
+  }
+}
+```
+
+</details>
+
 ## Usage
 
-As an open-source terminal agent, you can use Qwen Code in four primary ways:
+As an open-source terminal agent, you can use Qwen Code in five primary ways:
 
 1. Interactive mode (terminal UI)
 2. Headless mode (scripts, CI)
 3. IDE integration (VS Code, Zed)
-4. TypeScript SDK
+4. SDKs (TypeScript, Python, Java)
+5. Daemon mode — `qwen serve` exposes ACP over HTTP+SSE so multiple clients share one agent (experimental)
 
 #### Interactive mode
 
@@ -392,11 +462,52 @@ Use Qwen Code inside your editor (VS Code, Zed, and JetBrains IDEs):
 - [Use in Zed](https://qwenlm.github.io/qwen-code-docs/en/users/integration-zed/)
 - [Use in JetBrains IDEs](https://qwenlm.github.io/qwen-code-docs/en/users/integration-jetbrains/)
 
-#### TypeScript SDK
+#### Daemon mode (`qwen serve`, experimental)
 
-Build on top of Qwen Code with the TypeScript SDK:
+```bash
+cd your-project/
+qwen serve
+# → qwen serve listening on http://127.0.0.1:4170 (mode=http-bridge)
+```
 
-- [Use the Qwen Code SDK](./packages/sdk-typescript/README.md)
+Run Qwen Code as a local HTTP daemon so IDE plugins, web UIs, CI scripts and custom CLIs all share **one** agent session over HTTP+SSE — instead of each spawning their own subprocess. Loopback bind has no auth by default (set `QWEN_SERVER_TOKEN` to enable bearer auth even on loopback); remote binds (`--hostname 0.0.0.0`) **require** a token — boot refuses without one. See:
+
+- [Daemon mode user guide](https://qwenlm.github.io/qwen-code-docs/en/users/qwen-serve)
+- [HTTP protocol reference](https://qwenlm.github.io/qwen-code-docs/en/developers/qwen-serve-protocol)
+- [DaemonClient TypeScript quickstart](https://qwenlm.github.io/qwen-code-docs/en/developers/examples/daemon-client-quickstart)
+
+#### SDKs
+
+Build on top of Qwen Code with the available SDKs:
+
+- TypeScript: [Use the Qwen Code SDK](./packages/sdk-typescript/README.md)
+- Python: [Use the Python SDK](./packages/sdk-python/README.md)
+- Java: [Use the Java SDK](./packages/sdk-java/qwencode/README.md)
+
+Python SDK example:
+
+```python
+import asyncio
+
+from qwen_code_sdk import is_sdk_result_message, query
+
+
+async def main() -> None:
+    result = query(
+        "Summarize the repository layout.",
+        {
+            "cwd": "/path/to/project",
+            "path_to_qwen_executable": "qwen",
+        },
+    )
+
+    async for message in result:
+        if is_sdk_result_message(message):
+            print(message["result"])
+
+
+asyncio.run(main())
+```
 
 ## Commands & Shortcuts
 
@@ -458,6 +569,10 @@ Looking for a graphical interface?
 ## Troubleshooting
 
 If you encounter issues, check the [troubleshooting guide](https://qwenlm.github.io/qwen-code-docs/en/users/support/troubleshooting/).
+
+**Common issues:**
+
+- **`Qwen OAuth free tier was discontinued on 2026-04-15`**: Qwen OAuth is no longer available. Run `qwen` → `/auth` and switch to API Key or Coding Plan. See the [Authentication](#authentication) section above for setup instructions.
 
 To report a bug from within the CLI, run `/bug` and include a short title and repro steps.
 

@@ -24,6 +24,7 @@ These commands help you save, restore, and summarize work progress.
 | `/summary`  | Generate project summary based on conversation history    | `/summary`                           |
 | `/compress` | Replace chat history with summary to save Tokens          | `/compress`                          |
 | `/resume`   | Resume a previous conversation session                    | `/resume`                            |
+| `/recap`    | Generate a one-line session recap now                     | `/recap`                             |
 | `/restore`  | Restore files to state before tool execution              | `/restore` (list) or `/restore <ID>` |
 
 ### 1.2 Interface and Workspace Control
@@ -50,7 +51,7 @@ Commands specifically for controlling interface and output language.
 | → `ui [language]`     | Set UI interface language        | `/language ui zh-CN`       |
 | → `output [language]` | Set LLM output language          | `/language output Chinese` |
 
-- Available built-in UI languages: `zh-CN` (Simplified Chinese), `en-US` (English), `ru-RU` (Russian), `de-DE` (German)
+- Available built-in UI languages: `zh-CN` (Simplified Chinese), `en-US` (English), `ru-RU` (Russian), `de-DE` (German), `ja-JP` (Japanese), `pt-BR` (Portuguese - Brazil), `fr-FR` (French), `ca-ES` (Catalan)
 - Output language examples: `Chinese`, `English`, `Japanese`, etc.
 
 ### 1.4 Tool and Model Management
@@ -71,7 +72,10 @@ Commands for managing AI tools and models.
 | `/model`         | Switch model used in current session          | `/model`                                      |
 | `/model --fast`  | Set a lighter model for prompt suggestions    | `/model --fast qwen3-coder-flash`             |
 | `/extensions`    | List all active extensions in current session | `/extensions`                                 |
-| `/memory`        | Manage AI's instruction context               | `/memory add Important Info`                  |
+| `/memory`        | Open the Memory Manager dialog                | `/memory`                                     |
+| `/remember`      | Save a durable memory                         | `/remember Prefer terse responses`            |
+| `/forget`        | Remove matching entries from auto-memory      | `/forget <query>`                             |
+| `/dream`         | Manually run auto-memory consolidation        | `/dream`                                      |
 
 ### 1.5 Built-in Skills
 
@@ -153,7 +157,58 @@ The `/btw` command allows you to ask quick side questions without interrupting o
 >
 > Use `/btw` when you need a quick answer without derailing your main task. It's especially useful for clarifying concepts, checking facts, or getting quick explanations while staying focused on your primary workflow.
 
-### 1.7 Information, Settings, and Help
+### 1.7 Session Recap (`/recap`)
+
+The `/recap` command generates a short "where you left off" summary of the
+current session, so you can resume an old conversation without scrolling
+back through pages of history.
+
+| Command  | Description                                |
+| -------- | ------------------------------------------ |
+| `/recap` | Generate and show a one-line session recap |
+
+**How it works:**
+
+- Uses the configured fast model (`fastModel` setting) when available, falling
+  back to the main session model. A small, cheap model is enough for a recap.
+- The recent conversation (up to 30 messages, text only — tool calls and tool
+  responses are filtered out) is sent to the model with a tight system prompt.
+- The recap is rendered in dim color with a `❯` prefix so it stands apart
+  from real assistant replies.
+- Refuses with an inline error if a model turn is in flight or another command
+  is processing. If there is no usable conversation, or the underlying
+  generation fails, `/recap` shows a short info message instead of a recap —
+  the manual command always responds with something.
+
+**Auto-trigger when returning from being away:**
+
+If the terminal is blurred for **5+ minutes** and gets focused again, a recap
+is generated and shown automatically (only when no model response is in
+progress; otherwise it waits for the current turn to finish and then fires).
+Unlike the manual command, the auto-trigger is fully silent on failure: if
+generation errors or there is nothing to summarize, no message is added to
+the history. Controlled by the `general.showSessionRecap` setting
+(default: `true`); the manual `/recap` command always works regardless of
+this setting.
+
+**Example:**
+
+```
+> /recap
+
+❯ Refactoring loopDetectionService.ts to address long-session OOM caused by
+  unbounded streamContentHistory and contentStats. The next step is to
+  implement option B (LRU sliding window with FNV-1a) pending confirmation.
+```
+
+> [!tip]
+>
+> Configure a fast model via `/model --fast <model>` (e.g.
+> `qwen3-coder-flash`) to make `/recap` fast and cheap. Set
+> `general.showSessionRecap` to `false` to opt out of the auto-trigger
+> while keeping the manual command available.
+
+### 1.8 Information, Settings, and Help
 
 Commands for obtaining information and performing system settings.
 
@@ -168,7 +223,7 @@ Commands for obtaining information and performing system settings.
 | `/copy`     | Copy last output content to clipboard           | `/copy`                          |
 | `/quit`     | Exit Qwen Code immediately                      | `/quit` or `/exit`               |
 
-### 1.8 Common Shortcuts
+### 1.9 Common Shortcuts
 
 | Shortcut           | Function                | Note                   |
 | ------------------ | ----------------------- | ---------------------- |
@@ -178,21 +233,18 @@ Commands for obtaining information and performing system settings.
 | `Ctrl/cmd+Z`       | Undo input              | Text editing           |
 | `Ctrl/cmd+Shift+Z` | Redo input              | Text editing           |
 
-### 1.9 CLI Auth Subcommands
+### 1.10 Authentication Commands
 
-In addition to the in-session `/auth` slash command, Qwen Code provides standalone CLI subcommands for managing authentication directly from the terminal:
+Use `/auth` inside a Qwen Code session to configure authentication. Use `/doctor` to inspect the current authentication and environment status.
 
-| Command                                              | Description                                       |
-| ---------------------------------------------------- | ------------------------------------------------- |
-| `qwen auth`                                          | Interactive authentication setup                  |
-| `qwen auth qwen-oauth`                               | Authenticate with Qwen OAuth                      |
-| `qwen auth coding-plan`                              | Authenticate with Alibaba Cloud Coding Plan       |
-| `qwen auth coding-plan --region china --key sk-sp-…` | Non-interactive Coding Plan setup (for scripting) |
-| `qwen auth status`                                   | Show current authentication status                |
+| Command   | Description                                |
+| --------- | ------------------------------------------ |
+| `/auth`   | Configure authentication interactively     |
+| `/doctor` | Show authentication and environment checks |
 
-> [!tip]
+> [!note]
 >
-> These commands run outside of a Qwen Code session. Use them to configure authentication before starting a session, or in scripts and CI environments. See the [Authentication](../configuration/auth) page for full details.
+> The standalone `qwen auth` CLI command has been removed. Legacy invocations such as `qwen auth status` print a removal notice with migration guidance. See the [Authentication](../configuration/auth) page for full details.
 
 ## 2. @ Commands (Introducing Files)
 

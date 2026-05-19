@@ -14,19 +14,23 @@ import type { SelectionListItem } from '../../hooks/useSelectionList.js';
 
 export interface MultiSelectItem<T> extends SelectionListItem<T> {
   label: string;
+  separator?: boolean;
 }
 
 export interface MultiSelectProps<T> {
   items: Array<MultiSelectItem<T>>;
   initialIndex?: number;
-  initialSelectedKeys?: string[];
+  selectedKeys?: string[];
   onConfirm: (selectedValues: T[]) => void;
   onChange?: (selectedValues: T[]) => void;
+  onSelectedKeysChange?: (selectedKeys: string[]) => void;
   onHighlight?: (value: T) => void;
   isFocused?: boolean;
   showNumbers?: boolean;
   showScrollArrows?: boolean;
   maxItemsToShow?: number;
+  checkedText?: string;
+  showActiveMarker?: boolean;
 }
 
 const EMPTY_SELECTED_KEYS: string[] = [];
@@ -43,32 +47,20 @@ function getSelectedValues<T>(
 export function MultiSelect<T>({
   items,
   initialIndex = 0,
-  initialSelectedKeys = EMPTY_SELECTED_KEYS,
+  selectedKeys = EMPTY_SELECTED_KEYS,
   onConfirm,
   onChange,
+  onSelectedKeysChange,
   onHighlight,
   isFocused = true,
   showNumbers = true,
   showScrollArrows = false,
   maxItemsToShow = 10,
+  checkedText = '[✓]',
+  showActiveMarker = false,
 }: MultiSelectProps<T>): React.JSX.Element {
-  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(
-    () => new Set(initialSelectedKeys),
-  );
   const [scrollOffset, setScrollOffset] = useState(0);
-
-  useEffect(() => {
-    setSelectedKeys((prev) => {
-      const next = new Set(initialSelectedKeys);
-      if (
-        prev.size === next.size &&
-        Array.from(next).every((key) => prev.has(key))
-      ) {
-        return prev;
-      }
-      return next;
-    });
-  }, [initialSelectedKeys]);
+  const selectedKeySet = useMemo(() => new Set(selectedKeys), [selectedKeys]);
 
   const { activeIndex } = useSelectionList({
     items,
@@ -81,7 +73,7 @@ export function MultiSelect<T>({
     showNumbers: false,
     onHighlight,
     onSelect: () => {
-      onConfirm(getSelectedValues(items, selectedKeys));
+      onConfirm(getSelectedValues(items, selectedKeySet));
     },
   });
 
@@ -92,22 +84,18 @@ export function MultiSelect<T>({
         return;
       }
 
-      setSelectedKeys((prev) => {
-        const next = new Set(prev);
-        if (next.has(item.key)) {
-          next.delete(item.key);
-        } else {
-          next.add(item.key);
-        }
-        return next;
-      });
+      const next = new Set(selectedKeySet);
+      if (next.has(item.key)) {
+        next.delete(item.key);
+      } else {
+        next.add(item.key);
+      }
+      const nextKeys = Array.from(next);
+      onSelectedKeysChange?.(nextKeys);
+      onChange?.(getSelectedValues(items, next));
     },
-    [items],
+    [items, onChange, onSelectedKeysChange, selectedKeySet],
   );
-
-  useEffect(() => {
-    onChange?.(getSelectedValues(items, selectedKeys));
-  }, [items, selectedKeys, onChange]);
 
   useKeypress(
     (key) => {
@@ -152,12 +140,17 @@ export function MultiSelect<T>({
       {visibleItems.map((item, index) => {
         const itemIndex = scrollOffset + index;
         const isActive = activeIndex === itemIndex;
-        const isChecked = selectedKeys.has(item.key);
+        const isChecked = selectedKeySet.has(item.key);
+        const activeMarker = isActive ? '›' : ' ';
 
         const itemNumberText = `${String(itemIndex + 1).padStart(
           numberColumnWidth,
         )}.`;
-        const checkboxText = item.disabled ? '[x]' : isChecked ? '[✓]' : '[ ]';
+        const checkboxText = item.disabled
+          ? '[x]'
+          : isChecked
+            ? checkedText
+            : '[ ]';
 
         let textColor = theme.text.primary;
         if (item.disabled) {
@@ -168,8 +161,31 @@ export function MultiSelect<T>({
           textColor = theme.text.accent;
         }
 
+        if (item.separator) {
+          return (
+            <Box key={item.key} alignItems="flex-start">
+              {showActiveMarker && (
+                <Box minWidth={2} flexShrink={0}>
+                  <Text color={textColor}>{activeMarker}</Text>
+                </Box>
+              )}
+              <Box minWidth={4} flexShrink={0}>
+                <Text> </Text>
+              </Box>
+              <Box flexGrow={1}>
+                <Text color={theme.text.secondary}>{item.label}</Text>
+              </Box>
+            </Box>
+          );
+        }
+
         return (
           <Box key={item.key} alignItems="flex-start">
+            {showActiveMarker && (
+              <Box minWidth={2} flexShrink={0}>
+                <Text color={textColor}>{activeMarker}</Text>
+              </Box>
+            )}
             <Box minWidth={4} flexShrink={0}>
               <Text color={textColor}>{checkboxText}</Text>
             </Box>
